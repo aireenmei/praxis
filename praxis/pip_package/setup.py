@@ -28,7 +28,8 @@ setup(
     python_requires='>=3.7',
     install_requires=[
         'protobuf', 'absl-py', 'fiddle-config', 'numpy', 'tensorflow', 'lingvo',
-        'flax', 'jax', 'optax', 'optax-shampoo', 'jax-bitempered-loss',
+        'flax', 'jax', 'optax @ git+https://github.com/deepmind/optax#egg=optax',
+        'optax-shampoo', 'jax-bitempered-loss',
         'einops', 't5x', 'clu'
     ],
     url='https://github.com/google/praxis',
