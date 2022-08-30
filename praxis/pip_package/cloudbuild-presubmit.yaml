@@ -4,7 +4,7 @@ steps:
   args: [
           'build',
           '--build-arg', 'image_name=${_IMAGE_NAME}',
-          '-f', 'paxml/pip_package/presubmit.Dockerfile', '.'
+          '-f', 'praxis/pip_package/presubmit.Dockerfile', '.'
         ]
 
 substitutions:
