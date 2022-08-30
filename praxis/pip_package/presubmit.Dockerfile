@@ -5,7 +5,7 @@ FROM $base_image
 RUN rm -rf /praxis
 COPY . /praxis
 RUN pip install /praxis/praxis/pip_package
-RUN cd /praxis/praxis && bazel build ...
+RUN cd /praxis && bazel build ...
 
 WORKDIR /
 
