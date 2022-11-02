@@ -24,12 +24,12 @@ from typing import Any, Callable, Optional
 from flax import linen as nn
 import jax
 from jax import numpy as jnp
+from praxis import asserts
 from praxis import base_layer
 from praxis import flax_utils
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import checkpoint_policy
-import tensorflow.compat.v2 as tf
 
 NestedMap = py_utils.NestedMap
 JTensor = pytypes.JTensor
@@ -56,9 +56,6 @@ SCAN_VARIABLE_AXES = {
     DECODE_CACHE: 0,
     PREFIX_DECODE_CACHE: 0
 }
-# PARAMS is vmapped. Scan does not need to init vars, so PARAMS rng key is not
-# needed.
-SCAN_SPLIT_RNGS = {PARAMS: False, RANDOM: True}
 
 def _sum_aux_loss(tree):
   return jax.tree_map(jnp.sum, tree)
@@ -71,7 +68,7 @@ class Repeat(base_layer.BaseLayer):
     """Associated hyperparams for this layer class.
 
     Attributes:
-      sub: The parameterization of the sub-layer.
+      sub_tpl: The parameterization of the sub-layer.
       x_times: The number of times to repeat sub.
       unpack_summaries: If true, unpack summaries to the individual values from
         each loop iterations.
@@ -83,7 +80,7 @@ class Repeat(base_layer.BaseLayer):
       sublayer_name: Name of the sublayer. This affects the checkpoint variable
         paths.
     """
-    sub: Optional[BaseHParams] = None
+    sub_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
     x_times: int = 0
     unpack_summaries: bool = False
     checkpoint_policy: AutodiffCheckpointType = AutodiffCheckpointType.SAVE_NOTHING
@@ -102,50 +99,10 @@ class Repeat(base_layer.BaseLayer):
     """Constructor."""
     p = self.hparams
     assert p.x_times > 0
-    assert p.sub is not None
+    assert p.sub_tpl is not None
 
-    self.create_child(p.sublayer_name, p.sub)
+    self.create_child(p.sublayer_name, p.sub_tpl)
 
-  def force_init(self):
-    p = self.hparams
-
-    # nn.vmap variable_axes adds a leading stage axis to variable shapes.
-    def fn(model, _):
-      model.force_init(None)
-      return None, None
-
-    # nn.vmap variable_axes adds a leading stage axis to variable shapes.
-    vmapped_fn = nn.vmap(
-        fn,
-        variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs={
-            PARAMS: True,
-            RANDOM: True
-        },
-        axis_size=p.x_times)
-
-    wp = p.weight_split_dims_mapping
-    if wp.sub is not None:
-      assert isinstance(wp.sub, (list, tuple))
-      assert len(wp.sub) == 1
-      wp_sub = tuple(wp.sub)
-    else:
-      wp_sub = (-1,)
-
-    mapped_fn = vmapped_fn
-    for collection in (PARAMS, NON_TRAINABLE):
-      mapped_fn = nn.map_variables(
-          mapped_fn,
-          collection,
-          mutable=self.is_mutable_collection(collection),
-          trans_out_fn=functools.partial(
-              flax_utils.add_axis_to_metadata,
-              sub_weight_split_dims_mapping=wp_sub,
-              x_times=p.x_times))
-
-    mapped_fn(self.sublayer, None)  # scan requires a dummy carry input
-
-  # TODO(zhangqiaorjc): Allow callers to customize. body_fn.
   def __call__(self, inputs: NestedJTensor, *args: Any, **kwargs: Any) -> Any:
     """FProp inputs through the sub layer stack.
 
@@ -164,7 +121,7 @@ class Repeat(base_layer.BaseLayer):
 
     def body_fn(sub, layer_in):
       layer_out = sub(layer_in, *args, **kwargs)
-      tf.nest.assert_same_structure(layer_in, layer_out)
+      asserts.assert_same_structure(layer_in, layer_out)
       return layer_out, None
 
     # TODO(zhangqiaorjc): Use remat-scan?
@@ -176,8 +133,34 @@ class Repeat(base_layer.BaseLayer):
     scan_fn = nn.scan(
         rematted_body_fn,
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={
+            PARAMS: self.is_initializing(),
+            RANDOM: True
+        },
         length=p.x_times)
+
+    if self.is_initializing():
+      wp = p.weight_split_dims_mapping
+      if wp.sub is not None:
+        assert isinstance(wp.sub, (list, tuple))
+        assert len(wp.sub) == 1
+        wp_sub = tuple(wp.sub)
+      else:
+        wp_sub = (-1,)
+
+      for collection in (PARAMS, NON_TRAINABLE):
+        scan_fn = nn.map_variables(
+            scan_fn,
+            collection,
+            mutable=self.is_mutable_collection(collection),
+            trans_in_fn=functools.partial(
+                flax_utils.remove_axis_to_metadata,
+                sub_weight_split_dims_mapping=wp_sub,
+                x_times=p.x_times),
+            trans_out_fn=functools.partial(
+                flax_utils.add_axis_to_metadata,
+                sub_weight_split_dims_mapping=wp_sub,
+                x_times=p.x_times))
 
     mapped_scan_fn = nn.map_variables(
         scan_fn,
@@ -200,6 +183,10 @@ class Repeat(base_layer.BaseLayer):
 
     if p.unroll_in_decode:
 
+      def _clear_decode_cache(tree):
+        del tree
+        return {}
+
       def _unstack_cache(tree):
         new_tree = {}
         for collection, subtree in tree.items():
@@ -215,10 +202,32 @@ class Repeat(base_layer.BaseLayer):
       mapped_scan_fn = nn.map_variables(
           mapped_scan_fn, [DECODE_CACHE, PREFIX_DECODE_CACHE],
           mutable=True,
+          trans_in_fn=_clear_decode_cache,
           trans_out_fn=_unstack_cache)
 
     layer_out, _ = mapped_scan_fn(self.sublayer, inputs)
     return layer_out
+
+  def quantize_weight(self) -> NestedJTensor:
+    """Quantize the weight of the sublayer."""
+    p = self.hparams
+
+    def body_fn(sub, _):
+      res = sub.quantize_weight()
+      return None, res
+
+    scan_fn = nn.scan(
+        body_fn,
+        variable_axes=SCAN_VARIABLE_AXES,
+        split_rngs={RANDOM: True},
+        length=p.x_times)
+
+    _, res = scan_fn(self.sublayer, None)
+    ret = {}
+    for collection in [PARAMS, NON_TRAINABLE]:
+      if collection in res:
+        ret[collection] = {p.sublayer_name: res[collection]}
+    return ret
 
   @property
   def sublayer(self) -> base_layer.BaseLayer:
@@ -242,6 +251,8 @@ class Repeat(base_layer.BaseLayer):
     # TODO(team): Configure for spmd.
     p = self.hparams
 
+    assert not self.is_initializing()
+
     def body_fn(sub, _):
       sub.init_states(*args, **kwargs)
       return None, None
@@ -249,7 +260,10 @@ class Repeat(base_layer.BaseLayer):
     scan_fn = nn.scan(
         body_fn,
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={
+            PARAMS: self.is_initializing(),
+            RANDOM: True
+        },
         length=p.x_times)
 
     mapped_scan_fn = nn.map_variables(
@@ -352,10 +366,12 @@ class Repeat(base_layer.BaseLayer):
     """
     p = self.hparams
 
+    assert not self.is_initializing()
+
     # TODO(zhangqiaorjc): Apply remat?
     def body_fn(sub, layer_in):
       layer_out = sub.extend_step(layer_in, *args, **kwargs)
-      tf.nest.assert_same_structure(layer_in, layer_out)
+      asserts.assert_same_structure(layer_in, layer_out)
       return layer_out, None
 
     if p.unroll_in_decode:
@@ -366,7 +382,7 @@ class Repeat(base_layer.BaseLayer):
         body_fn,
         in_axes=0,  # scan over axis 0 for layer_states
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={RANDOM: True},
         length=p.x_times)
 
     mapped_scan_fn = nn.map_variables(
@@ -400,6 +416,8 @@ class Repeat(base_layer.BaseLayer):
     """Transforms all decode state variables based on transform_fn."""
     p = self.hparams
 
+    assert not self.is_initializing()
+
     def body_fn(sub, _):
       sub.transform_decode_state(transform_fn)
       return None, None
@@ -411,7 +429,7 @@ class Repeat(base_layer.BaseLayer):
     scan_fn = nn.scan(
         body_fn,
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={RANDOM: True},
         length=p.x_times)
 
     mapped_scan_fn = nn.map_variables(
@@ -444,6 +462,8 @@ class Repeat(base_layer.BaseLayer):
     """
     p = self.hparams
 
+    assert not self.is_initializing()
+
     def body_fn(sub, _):
       sub.lazy_broadcast_prefix(num_suffix_samples, suffix_length)
       return None, None
@@ -454,7 +474,7 @@ class Repeat(base_layer.BaseLayer):
     scan_fn = nn.scan(
         body_fn,
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={RANDOM: True},
         length=p.x_times)
 
     mapped_scan_fn = nn.map_variables(
@@ -493,7 +513,7 @@ class Repeat(base_layer.BaseLayer):
     scan_fn = nn.scan(
         body_fn,
         variable_axes=SCAN_VARIABLE_AXES,
-        split_rngs=SCAN_SPLIT_RNGS,
+        split_rngs={RANDOM: True},
         length=p.x_times)
 
     mapped_scan_fn = nn.map_variables(

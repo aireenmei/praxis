@@ -39,12 +39,14 @@ def add_axis_to_metadata(tree, sub_weight_split_dims_mapping, x_times):
         safe_fn, tree, is_leaf=lambda x: isinstance(x, base_layer.BoxedParam))
 
   def update(boxed):
-    if boxed.meta.repeat_prefix is not None:
+    if boxed.meta.repeat_prefix:
+      assert isinstance(boxed.meta.repeat_prefix, list)
       repeat_prefix = [x_times] + boxed.meta.repeat_prefix
     else:
       repeat_prefix = [x_times]
 
-    if boxed.meta.repeat_prefix_split_dims_mapping is not None:
+    if boxed.meta.repeat_prefix_split_dims_mapping:
+      assert isinstance(boxed.meta.repeat_prefix_split_dims_mapping, tuple)
       repeat_prefix_split_dims_mapping = wp_sub + tuple(
           boxed.meta.repeat_prefix_split_dims_mapping)
     else:
@@ -53,6 +55,35 @@ def add_axis_to_metadata(tree, sub_weight_split_dims_mapping, x_times):
     boxed.meta.repeat_prefix = repeat_prefix
     boxed.meta.repeat_prefix_split_dims_mapping = (
         repeat_prefix_split_dims_mapping)
+    return base_layer.BoxedParam(value=boxed.value, meta=boxed.meta)
+
+  return _tree_map_boxed(update, tree)
+
+
+def remove_axis_to_metadata(tree, sub_weight_split_dims_mapping, x_times):
+  """Remove an axis to the metadata."""
+  wp_sub = sub_weight_split_dims_mapping
+
+  def _tree_map_boxed(fn, tree):
+    """Only map over Boxed leaves in pytree - identity for other leaves."""
+    safe_fn = lambda x: fn(x) if isinstance(x, base_layer.BoxedParam) else x
+    return jax.tree_map(
+        safe_fn, tree, is_leaf=lambda x: isinstance(x, base_layer.BoxedParam))
+
+  def update(boxed):
+
+    if boxed.meta.repeat_prefix:
+      assert isinstance(boxed.meta.repeat_prefix, list)
+      removed_axis = boxed.meta.repeat_prefix.pop(0)
+      assert removed_axis == x_times
+
+    if boxed.meta.repeat_prefix_split_dims_mapping:
+      assert isinstance(boxed.meta.repeat_prefix_split_dims_mapping, tuple)
+      updated_dims_mapping = list(boxed.meta.repeat_prefix_split_dims_mapping)
+      removed = updated_dims_mapping.pop(0)
+      assert (removed,) == tuple(wp_sub)
+      boxed.meta.repeat_prefix_split_dims_mapping = updated_dims_mapping
+
     return base_layer.BoxedParam(value=boxed.value, meta=boxed.meta)
 
   return _tree_map_boxed(update, tree)
@@ -113,6 +144,10 @@ def convert_to_boxed_params(
 
   def to_boxed(x_param, var_collection: str,
                logical_axes: Optional[pjit.PartitionSpec]):
+    if isinstance(x_param, base_layer.BoxedParam):
+      # The param might already be boxed (if the flax module contain praxis
+      # submodules). We should not box it again.
+      return x_param
     if logical_axes is None:
       tensor_split_dims_mapping = None
     else:
@@ -161,11 +196,15 @@ def convert_to_boxed_params(
           flat_full_logical_axes_tree, sep='/')
       boxed_params[key] = jax.tree_map(
           lambda x, y: to_boxed(x, var_collection=key, logical_axes=y),
-          var_tree[key], full_logical_axes_tree)
+          var_tree[key],
+          full_logical_axes_tree,
+          # Consider BoxedParam as leaf to prevent boxing it again.
+          is_leaf=lambda x: isinstance(x, base_layer.BoxedParam))
     else:
       boxed_params[key] = jax.tree_map(
           lambda x: to_boxed(x, var_collection=key, logical_axes=None),
-          var_tree[key])
+          var_tree[key],
+          is_leaf=lambda x: isinstance(x, base_layer.BoxedParam))
     # pylint: enable=cell-var-from-loop
 
   return boxed_params

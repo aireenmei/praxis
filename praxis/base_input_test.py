@@ -449,7 +449,77 @@ class InputTest(test_utils.TestCase):
       with self.assertRaises(StopIteration):
         inputs[i].get_next()
 
-  def test_multi_stream_input(self):
+  def test_lingvo_eval_adaptor_get_batch_size(self):
+    input_p = base_input_generator.BaseSequenceInputGenerator.Params().Set(
+        bucket_batch_limit=[1])
+    adaptor_p = base_input.LingvoEvalAdaptor.HParams(
+        input=input_p, batch_size=2)
+    self.assertEqual(adaptor_p.cls.get_batch_size(adaptor_p), 2)
+
+  def test_lingvo_lazy_eval_adaptor(self):
+    tmp = os.path.join(FLAGS.test_tmpdir, 'lazy_eval_adaptor')
+    num_data = 13
+    with tf.io.TFRecordWriter(tmp) as w:
+      for i in range(num_data):
+        w.write(('%04d' % i).encode('utf-8'))
+
+    input_p = LingvoInput.Params().Set(
+        file_pattern='tfrecord:' + tmp, file_random_seed=301, repeat_count=-1)
+    input_p.batch_size = 3
+    input_p.num_samples = num_data
+    input_p.file_buffer_size = 1
+    input_p.file_parallelism = 1
+    eval_p = base_input.LingvoLazyEvalAdaptor.HParams(
+        input=input_p,
+        is_training=False,
+        cluster_do_eval=True,
+        reset_for_eval=True,
+        num_infeed_hosts=3,
+        allow_fixed_file_random_seed=True)
+    input_params = [
+        eval_p.clone().set(infeed_host_index=i)
+        for i in range(eval_p.num_infeed_hosts)
+    ]
+    inputs = [instantiate(p) for p in input_params]
+    num_samples = [input.num_samples for input in inputs]
+    self.assertArraysEqual(num_samples, [6, 4, 3])
+    batches = []
+    # We have 13 examples and global batch size of 9=3x3, hence 2 batches.
+    num_batches = input_p.num_samples // (input_p.batch_size *
+                                          eval_p.num_infeed_hosts) + 1
+    for i in range(num_batches):
+      batches.extend([inp.get_next() for inp in inputs])
+    self.assertArraysEqual(batches[0].num, np.array([0, 1, 2], dtype=np.int32))
+    self.assertArraysEqual(batches[1].num, np.array([3, 4, 5], dtype=np.int32))
+    self.assertArraysEqual(batches[2].num, np.array([6, 7, 8], dtype=np.int32))
+    self.assertArraysEqual(batches[3].num, np.array([9, 10, 11],
+                                                    dtype=np.int32))
+    self.assertArraysEqual(batches[4].num, np.array([12, 0, 1], dtype=np.int32))
+    self.assertArraysEqual(batches[5].num, np.array([9, 10, 11],
+                                                    dtype=np.int32))
+    self.assertArraysEqual(batches[0].eval_sample_weights,
+                           np.array([1., 1., 1.], dtype=np.float32))
+    self.assertArraysEqual(batches[1].eval_sample_weights,
+                           np.array([1., 1., 1.], dtype=np.float32))
+    self.assertArraysEqual(batches[2].eval_sample_weights,
+                           np.array([1., 1., 1.], dtype=np.float32))
+    self.assertArraysEqual(batches[3].eval_sample_weights,
+                           np.array([1., 1., 1.], dtype=np.float32))
+    # Starts to emit paddings after the 13-th example.
+    self.assertArraysEqual(batches[4].eval_sample_weights,
+                           np.array([1., 0., 0.], dtype=np.float32))
+    self.assertArraysEqual(batches[5].eval_sample_weights,
+                           np.array([0., 0., 0.], dtype=np.float32))
+    # After 2 batches, all 3 inputs raise at the same time.
+    for i in range(eval_p.num_infeed_hosts):
+      with self.assertRaisesRegex(tf.errors.OutOfRangeError,
+                                  '2 batches have been exhausted.'):
+        inputs[i].get_next()
+    inputs[0].reset()
+    self.assertArraysEqual(inputs[0].get_next().num,
+                           np.array([0, 1, 2], dtype=np.int32))
+
+  def test_multi_input(self):
     tmp_1 = os.path.join(FLAGS.test_tmpdir, 'tmptest_1')
     tmp_2 = os.path.join(FLAGS.test_tmpdir, 'tmptest_2')
     batch_size_1 = 2
@@ -487,21 +557,21 @@ class InputTest(test_utils.TestCase):
     p2.is_training = False
     p2.cluster_do_eval = True
 
-    streams = {
-        'stream_1': p,
-        'stream_2': p2,
+    inputs = {
+        'input_1': p,
+        'input_2': p2,
     }
-    multi_p = base_input.MultiStreamInput.HParams(input_streams=streams)
-    multi_p.default_stream = 'stream_1'
+    multi_p = base_input.MultiInput.HParams(input_to_params=inputs)
+    multi_p.default_input = 'input_1'
     inp = instantiate(multi_p)
     for i in range(num_batches):
       batch = inp.get_next()
       self.assertArraysEqual(
-          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.stream_1.num)
+          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.input_1.num)
       self.assertArraysEqual(
-          np.array([num_data_2 - i], dtype=np.int32), batch.stream_2.num)
+          np.array([num_data_2 - i], dtype=np.int32), batch.input_2.num)
 
-  def test_multi_stream_input_eval(self):
+  def test_multi_input_eval(self):
     tmp_1 = os.path.join(FLAGS.test_tmpdir, 'tmptest_1')
     batch_size_1 = 2
     num_batches = 10
@@ -520,17 +590,17 @@ class InputTest(test_utils.TestCase):
     p.is_training = False
     p.cluster_do_eval = True
 
-    streams = {
-        'stream_1': p,
+    inputs = {
+        'input_1': p,
     }
-    multi_p = base_input.MultiStreamInput.HParams(input_streams=streams)
-    multi_p.default_stream = 'stream_1'
+    multi_p = base_input.MultiInput.HParams(input_to_params=inputs)
+    multi_p.default_input = 'input_1'
     multi_p.reset_for_eval = True
     inp = instantiate(multi_p)
     for i in range(num_batches):
       batch = inp.get_next()
       self.assertArraysEqual(
-          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.stream_1.num)
+          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.input_1.num)
     with self.assertRaisesRegex(tf.errors.OutOfRangeError,
                                 'SequentialRecordYielder reached 1 repeat'):
       inp.get_next()
@@ -538,8 +608,35 @@ class InputTest(test_utils.TestCase):
     for i in range(num_batches):
       batch = inp.get_next()
       self.assertArraysEqual(
-          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.stream_1.num)
+          np.array([2 * i, 2 * i + 1], dtype=np.int32), batch.input_1.num)
 
+  def test_multi_input_get_batch_size(self):
+    batch_size_1 = 2
+    batch_size_2 = 1
+
+    p = base_input.LingvoInputAdaptor.HParams()
+    p.input = LingvoInput.Params()
+    p.input.file_pattern = 'tfrecord:dummy'
+    p.input.batch_size = batch_size_1
+    p.input.file_random_seed = 0
+    p.input.repeat_count = 1
+    p.is_training = True
+
+    p2 = base_input.LingvoInputAdaptor.HParams()
+    p2.input = LingvoInput.Params()
+    p2.input.file_pattern = 'tfrecord:dummy'
+    p2.input.batch_size = batch_size_2
+    p2.input.file_random_seed = 0
+    p2.input.repeat_count = 1
+    p2.is_training = True
+
+    inputs = {
+        'input_1': p,
+        'input_2': p2,
+    }
+    multi_p = base_input.MultiInput.HParams(input_to_params=inputs)
+    multi_bs = base_input.MultiInput.get_batch_size(multi_p)
+    self.assertEqual(multi_bs, batch_size_1)
 
 if __name__ == '__main__':
   absltest.main()

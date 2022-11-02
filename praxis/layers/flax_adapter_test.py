@@ -74,16 +74,7 @@ class MixLayer(base_layer.BaseLayer):
   def setup(self) -> None:
     super().setup()
 
-    def cnn_init_args():
-      return jnp.zeros((256, 256, 3)),
-
-    def cnn_init_kwargs():
-      return {'use_running_average': self.hparams.use_running_average}
-
-    cnn_p = flax_adapter.FlaxModuleAdapter.HParams(
-        module_factory_method=CNN,
-        var_init_args=cnn_init_args,
-        var_init_kwargs=cnn_init_kwargs)
+    cnn_p = flax_adapter.FlaxModuleAdapter.HParams(module_factory_method=CNN)
 
     self.create_child('cnn_p1', cnn_p.clone())
     self.create_child('cnn_p2', cnn_p.clone())
@@ -92,7 +83,10 @@ class MixLayer(base_layer.BaseLayer):
 
   def __call__(self, x: JTensor) -> Tuple[JTensor, JTensor, JTensor]:
     p = self.hparams
-    out1 = self.cnn_p1(x, use_running_average=p.use_running_average)
+    # Call cnn_p1 twice to verify this doesn't break initialization.
+    out1 = (
+        self.cnn_p1(x, use_running_average=p.use_running_average) +
+        self.cnn_p1(x / 2., use_running_average=p.use_running_average))
     out2 = self.cnn_p2(x, use_running_average=p.use_running_average)
     out = self.bn(out1 + out2)
     return out1, out2, out
@@ -110,37 +104,33 @@ class FlaxWrapperTest(test_utils.TestCase):
 
     prng_key = jax.random.PRNGKey(seed=123)
 
-    init_var_meta = test_layer.abstract_init_with_metadata(prng_key)
-
-    def assert_learnable(x):
-      assert not x.collections
-
-    jax.tree_map(assert_learnable, init_var_meta['params'])
-
-    def assert_non_learnable(x):
-      assert WeightHParamsCollection.NON_TRAINABLE in x.collections
-      assert WeightHParamsCollection.REQUIRES_MEAN_SYNC in x.collections
-
-    jax.tree_map(assert_non_learnable, init_var_meta['batch_stats'])
-    jax.tree_map(assert_non_learnable, init_var_meta['non_trainable'])
-
-    init_vars = test_layer.init(prng_key)
     input_x = jnp.zeros((256, 256, 3))
     with base_layer.JaxContext.new_context():
+      init_var_meta = test_layer.abstract_init_with_metadata(input_x)
+
+      def assert_learnable(x):
+        assert not x.collections
+
+      jax.tree_map(assert_learnable, init_var_meta['params'])
+
+      def assert_non_learnable(x):
+        assert WeightHParamsCollection.NON_TRAINABLE in x.collections
+        assert WeightHParamsCollection.REQUIRES_MEAN_SYNC in x.collections
+
+      jax.tree_map(assert_non_learnable, init_var_meta['batch_stats'])
+      jax.tree_map(assert_non_learnable, init_var_meta['non_trainable'])
+      init_vars = test_layer.init(prng_key, input_x)
       _ = test_layer.apply(init_vars, input_x, mutable=True)
 
   def test_literal_init_args(self):
     """Tests construction with literal (non-callable) init args."""
-    test_layer_p = flax_adapter.FlaxModuleAdapter.HParams(
-        name='test_layer',
-        module_factory_method=CNN,
-        var_init_args=(np.zeros((256, 256, 3)),),
-        var_init_kwargs={'use_running_average': True})
+    test_layer_p = flax_adapter.FlaxModuleAdapter.config(
+        name='test_layer', module_factory_method=CNN)
     test_layer = instantiate(test_layer_p)
 
-    init_vars = test_layer.init(jax.random.PRNGKey(seed=123))
     input_x = jnp.zeros((256, 256, 3))
     with base_layer.JaxContext.new_context():
+      init_vars = test_layer.init(jax.random.PRNGKey(seed=123), input_x)
       _ = test_layer.apply(init_vars, input_x)
 
   def test_wrap_sharding_spec(self):
@@ -152,30 +142,30 @@ class FlaxWrapperTest(test_utils.TestCase):
             'w',
             jax.nn.initializers.ones, (3, 4),
             jnp.float32,
-            axes=('output', 'input'))
+            axes=('input', 'output'))
         # Do not annotate with param_axes on purpose since users may mix
         # Flax modules which do not have sharding annotations with Flaxformer
         # models which do.
-        self.b = self.param('b', jax.nn.initializers.zeros, (3,), jnp.float32)
+        self.b = self.param('b', jax.nn.initializers.zeros, (4,), jnp.float32)
 
       def __call__(self, x):
-        return jnp.dot(self.w, x) + self.b
+        return jnp.dot(x, self.w) + self.b
 
+    logical_axes_rules = [
+        ('input', 'mdl'),
+        ('output', 'data'),
+    ]
     layer_p = flax_adapter.FlaxModuleAdapter.config(
         name='flax_adapter',
         module_factory_method=SimpleLinear,
-        var_init_args=lambda: [jnp.array([1, 2, 3, 4])],
-        logical_axes_rules=[
-            ('input', 'mdl'),
-            ('output', 'data'),
-        ],
+        logical_axes_rules=logical_axes_rules,
         ici_mesh_shape=[4, 2],
         mesh_axis_names=['data', 'model'],
     )
     layer = instantiate(layer_p)
-    variables = layer.abstract_init_with_metadata(jax.random.PRNGKey(0))
+    variables = layer.abstract_init_with_metadata(jnp.ones((2, 3)))
     w_sharding = variables['params']['cld']['w'].tensor_split_dims_mapping
-    self.assertEqual(w_sharding, ['data', 'mdl'])
+    self.assertEqual(w_sharding, ['mdl', 'data'])
     b_sharding = variables['params']['cld']['b'].tensor_split_dims_mapping
     self.assertEqual(b_sharding, [None])
 
@@ -185,13 +175,13 @@ class FiddleFlaxModuleAdapter(test_utils.TestCase):
   def test_simple_dense(self):
     test_layer_p = flax_adapter.FiddleFlaxModuleAdapter.config(
         name='test_layer',
-        flax_module_factory=fdl.Partial(flax_nn.Dense, features=32),
-        var_init_args=(np.zeros(5),))
+        flax_module_factory=fdl.Partial(flax_nn.Dense, features=32))
     test_layer = instantiate(test_layer_p)
 
-    init_vars = test_layer.init(jax.random.PRNGKey(seed=123))
+    inputs = jnp.zeros(5)
     with base_layer.JaxContext.new_context():
-      out = test_layer.apply(init_vars, jnp.zeros(5))
+      init_vars = test_layer.init(jax.random.PRNGKey(seed=123), inputs)
+      out = test_layer.apply(init_vars, inputs)
       self.assertEqual(out.shape, (32,))
 
 
@@ -214,18 +204,42 @@ class PaxWrapperTest(test_utils.TestCase):
 
     key = jax.random.PRNGKey(1)
     m = SomeFlaxModel(bn_p)
-    print(m)
     input_x = jnp.ones((4, 4, 3))
     with base_layer.JaxContext.new_context():
       initial_vars = m.init(key, input_x)
-      print(initial_vars)
       wrapped_layer_res = m.apply(initial_vars, input_x)
-      print(wrapped_layer_res)
 
       pax_layer = bn_p.Instantiate()
-      initial_vars = pax_layer.init(key)
+      initial_vars = pax_layer.init(key, input_x)
       pax_layer_res = pax_layer.apply(initial_vars, input_x)
       self.assertAllClose(wrapped_layer_res, pax_layer_res)
+
+  def test_wrap_pax_layer_then_adapter(self):
+    bn_p = normalizations.BatchNorm.HParams(name='pax_bn', dim=5)
+
+    # The flax module contains praxis layers.
+    # But it is also adapted into a praxis layer.
+    class SomeFlaxModel(flax_nn.Module):
+      bn_p: Any
+
+      @flax_nn.compact
+      def __call__(self, x: JTensor) -> JTensor:
+        x = flax_nn.Dense(5)(x)
+        x = self.bn_p.Instantiate()(x)
+        return x
+
+    test_layer_p = flax_adapter.FlaxModuleAdapter.HParams(
+        module_factory_method=lambda: SomeFlaxModel(bn_p), name='test_layer')
+    test_layer = instantiate(test_layer_p)
+    inputs = jnp.zeros((5, 5))
+    with base_layer.JaxContext.new_context():
+      init_vars = test_layer.init(jax.random.PRNGKey(seed=123), inputs)
+      leaves = jax.tree_util.tree_leaves(
+          init_vars, is_leaf=lambda x: isinstance(x, base_layer.BoxedParam))
+      # Check that init variables are unboxed.
+      self.assertFalse(
+          any(isinstance(x, base_layer.BoxedParam) for x in leaves))
+      test_layer.apply(init_vars, inputs)
 
   def test_wrap_pax_layer(self):
     bn_p = normalizations.BatchNorm.HParams(name='pax_bn', dim=3)
@@ -246,7 +260,7 @@ class PaxWrapperTest(test_utils.TestCase):
       initial_vars = m.init(key, input_x)
       wrapped_layer_res = m.apply(initial_vars, input_x)
 
-      initial_vars = pax_layer.init(key)
+      initial_vars = pax_layer.init(key, input_x)
       pax_layer_res = pax_layer.apply(initial_vars, input_x)
       self.assertAllClose(wrapped_layer_res, pax_layer_res)
 

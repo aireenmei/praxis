@@ -77,6 +77,23 @@ class FeedForward(base_layer.BaseLayer):
     return out
 
 
+class RepeatCalledTwice(base_layer.BaseLayer):
+
+  def setup(self):
+    sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
+    p = repeats.Repeat.HParams(
+        name='repeated_ffn',
+        sub_tpl=sub_p,
+        x_times=3)
+
+    self.create_child('repeated_ffn', p)
+
+  def __call__(self, x):
+    x = self.repeated_ffn(x)
+    x = self.repeated_ffn(x)
+    return x
+
+
 class Decoder(base_layer.BaseLayer):
   """Decoder layer."""
 
@@ -127,7 +144,7 @@ class RepeatsTest(test_utils.TestCase):
     sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
     p = repeats.Repeat.HParams(
         name='repeated_ffn',
-        sub=sub_p,
+        sub_tpl=sub_p,
         x_times=5,
         unpack_summaries=unpack_summaries)
     repeated_ffn = instantiate(p)
@@ -137,7 +154,7 @@ class RepeatsTest(test_utils.TestCase):
     x = jax.random.uniform(input_random_key, shape=(4, 2))
 
     k, init_key = jax.random.split(k)
-    weight_hparams = repeated_ffn.abstract_init_with_metadata(init_key, x)
+    weight_hparams = repeated_ffn.abstract_init_with_metadata(x)
     self.assertEqual(set(weight_hparams), {PARAMS, NON_TRAINABLE})
     self.assertEqual(weight_hparams[PARAMS]['sub']['w'].shape, [2, 2])
     self.assertEqual(weight_hparams[PARAMS]['sub']['w'].repeat_prefix, [5])
@@ -183,7 +200,10 @@ class RepeatsTest(test_utils.TestCase):
 
     sub_p = Decoder.HParams(model_dim=4)
     p = repeats.Repeat.HParams(
-        name='repeated_decoder', sub=sub_p, x_times=5, unroll_in_decode=unroll)
+        name='repeated_decoder',
+        sub_tpl=sub_p,
+        x_times=5,
+        unroll_in_decode=unroll)
     repeated_decoder = instantiate(p)
 
     k = jax.random.PRNGKey(123)
@@ -205,6 +225,49 @@ class RepeatsTest(test_utils.TestCase):
           method=repeated_decoder.extend_step)
       self.assertAllClose(step_out, fprop_outs[:, t])
 
+  def test_repeat_called_twice(self):
+    p = RepeatCalledTwice.HParams(name='repeat_called_twice')
+    repeated_layer = instantiate(p)
+
+    k = jax.random.PRNGKey(123)
+    k, input_random_key = jax.random.split(k)
+    x = jax.random.uniform(input_random_key, shape=(4, 2))
+    k, init_key = jax.random.split(k)
+    weight_hparams = repeated_layer.abstract_init_with_metadata(x)
+    print('weight_hparams = ', weight_hparams)
+
+
+class RepeatsQuantizeTest(test_utils.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    np.random.seed(123456)
+
+  def test_quantize_repeats(self):
+
+    sub_p = FeedForward.HParams(input_dim=2, output_dim=2)
+    p = repeats.Repeat.HParams(name='ffn', sub_tpl=sub_p, x_times=5)
+    ffn = instantiate(p)
+
+    inputs = np.random.normal(1.0, 1.5, [2, 2]).astype(np.float32)
+    prng_key = jax.random.PRNGKey(seed=123)
+    init_vars = ffn.init(prng_key, inputs)
+
+    res, _ = ffn.apply(init_vars, mutable=[], method=ffn.quantize_weight)
+    shapes = jax.tree_map(lambda x: x.shape, res)
+    expected_shapes = {
+        'non_trainable': {
+            'sub': {
+                'step': (5,)
+            }
+        },
+        'params': {
+            'sub': {
+                'w': (5, 2, 2)
+            }
+        }
+    }
+    self.assertEqual(shapes, expected_shapes)
 
 if __name__ == '__main__':
   absltest.main()

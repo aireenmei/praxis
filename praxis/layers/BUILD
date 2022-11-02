@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Description:
-#   Lingvo Jax layers. The public API is defined in __init__.py.
+#   Praxis layers. The public API is defined in __init__.py.
 
 load("//praxis:praxis.bzl", "py_strict_test")
 load("//praxis:praxis.bzl", "pytype_strict_library")
@@ -77,6 +77,7 @@ pytype_strict_library(
     deps = [
         ":activations",
         ":normalizations",
+        ":transformers",
         # Implicit jax dependency.
         "//praxis:asserts",
         "//praxis:base_layer",
@@ -92,6 +93,7 @@ pytype_strict_library(
     deps = [
         ":embedding_softmax",
         ":stochastics",
+        # Implicit absl.logging dependency.
         # Implicit flax.core dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
@@ -181,6 +183,8 @@ pytype_strict_library(
         ":normalizations",
         ":transformer_models",
         ":transformers",
+        "//praxis:base_layer",
+        "//praxis:pax_fiddle",
     ],
 )
 
@@ -220,7 +224,7 @@ pytype_strict_library(
         ":resnets",
         ":transformer_models",
         # Implicit absl.logging dependency.
-        "//third_party/py/clu:metrics",
+        # Implicit clu.metrics dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
         "//praxis:asserts",
@@ -232,6 +236,7 @@ pytype_strict_library(
         "//praxis:decoder_utils",
         "//praxis:flat_beam_search",
         "//praxis:metric_utils",
+        "//praxis:pax_fiddle",
         "//praxis:py_utils",
         "//praxis:sample_decode",
     ],
@@ -275,11 +280,9 @@ pytype_strict_library(
     ],
     srcs_version = "PY3",
     deps = [
-        # Implicit absl.logging dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
         # Implicit optax dependency.
-        "//praxis:py_utils",
         "//praxis:pytypes",
     ],
 )
@@ -358,11 +361,11 @@ pytype_strict_library(
         ":checkpoint_policy",
         # Implicit flax.core dependency.
         # Implicit jax dependency.
+        "//praxis:asserts",
         "//praxis:base_layer",
         "//praxis:flax_utils",
         "//praxis:py_utils",
         "//praxis:pytypes",
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -504,7 +507,9 @@ py_strict_test(
     deps = [
         ":adapters",
         ":normalizations",
+        ":transformers",
         # Implicit absl.testing.absltest dependency.
+        # Implicit absl.testing.parameterized dependency.
         # Implicit jax dependency.
         # Implicit lingvo.core.cluster_factory dependency.
         # Implicit lingvo.core.layers dependency.
@@ -522,6 +527,7 @@ py_strict_test(
     python_version = "PY3",
     srcs_version = "PY3",
     deps = [
+        ":attentions",
         ":conformers",
         # Implicit absl.testing.absltest dependency.
         # Implicit absl.testing.parameterized dependency.
@@ -549,6 +555,7 @@ pytype_strict_library(
         ":transformers",
         # Implicit jax dependency.
         "//praxis:asserts",
+        "//praxis:base_hyperparams",
         "//praxis:base_layer",
         "//praxis:py_utils",
     ],
@@ -579,7 +586,6 @@ pytype_strict_library(
         ":stochastics",
         # Implicit absl.logging dependency.
         # Implicit jax dependency.
-        "//third_party/py/jax:experimental_host_callback",
         # Implicit numpy dependency.
         "//praxis:base_layer",
         "//praxis:gshard_utils",
@@ -594,6 +600,7 @@ pytype_strict_library(
     deps = [
         ":attentions",
         ":embedding_softmax",
+        ":multi_query_attention",
         ":normalizations",
         ":transformers",
         # Implicit jax dependency.
@@ -609,6 +616,7 @@ py_strict_test(
     srcs = ["vits_test.py"],
     deps = [
         ":activations",
+        ":embedding_softmax",
         ":transformers",
         ":vits",
         # Implicit absl.testing.absltest dependency.
@@ -683,7 +691,6 @@ py_strict_test(
     srcs_version = "PY3",
     deps = [
         ":objectives",
-        # Implicit absl.logging dependency.
         # Implicit absl.testing.absltest dependency.
         # Implicit jax dependency.
         # Implicit jax.experimental.jax2tf dependency.
@@ -781,6 +788,7 @@ py_strict_test(
     srcs_version = "PY3",
     deps = [
         ":models",
+        ":resnets",
         ":transformer_models",
         # Implicit absl.testing.absltest dependency.
         # Implicit absl.testing.parameterized dependency.
@@ -789,6 +797,7 @@ py_strict_test(
         "//praxis:base_layer",
         "//praxis:decoder_utils",
         "//praxis:py_utils",
+        "//praxis:pytypes",
         "//praxis:test_utils",
     ],
 )
@@ -949,6 +958,7 @@ py_strict_test(
     shard_count = 27,
     srcs_version = "PY3",
     deps = [
+        ":attentions",
         ":embedding_softmax",
         ":glam",
         ":ngrammer",
@@ -1004,6 +1014,7 @@ pytype_strict_library(
     srcs_version = "PY3",
     deps = [
         ":flax_adapter",
+        # Implicit flaxformer.architectures.t5.parallel_fused_decoder dependency.
         # Implicit flaxformer.architectures.t5.t5_architecture dependency.
         # Implicit flaxformer.components.dense dependency.
         # Implicit flaxformer.components.embedding dependency.
@@ -1015,8 +1026,10 @@ pytype_strict_library(
         # Implicit jax dependency.
         "//praxis:base_layer",
         "//praxis:base_model",
+        "//praxis:decoder_hparams",
         "//praxis:py_utils",
         "//praxis:pytypes",
+        # Implicit t5x.decoding dependency.
         # Implicit t5x.losses dependency.
     ],
 )
@@ -1076,7 +1089,7 @@ py_strict_test(
         "//praxis:py_utils",
         "//praxis:test_utils",
         # Implicit t5x.models dependency.
-        "//third_party/py/t5x:partitioning",
+        # Implicit t5x.partitioning dependency.
     ],
 )
 
@@ -1090,6 +1103,29 @@ py_strict_test(
         # Implicit absl.testing.absltest dependency.
         # Implicit absl.testing.parameterized dependency.
         # Implicit jax dependency.
+        # Implicit numpy dependency.
+        "//praxis:base_layer",
+        "//praxis:py_utils",
+        "//praxis:test_utils",
+        # Implicit tensorflow_no_contrib dependency.
+    ],
+)
+
+py_strict_test(
+    name = "convolutions_test",
+    srcs = ["convolutions_test.py"],
+    python_version = "PY3",
+    shard_count = 10,
+    srcs_version = "PY3",
+    deps = [
+        ":convolutions",
+        # Implicit absl.logging dependency.
+        # Implicit absl.testing.absltest dependency.
+        # Implicit absl.testing.parameterized dependency.
+        # Implicit jax dependency.
+        # Implicit lingvo.core.cluster_factory dependency.
+        # Implicit lingvo.core.conformer_layer dependency.
+        # Implicit core.conv_layers_with_time_padding dependency.
         # Implicit numpy dependency.
         "//praxis:base_layer",
         "//praxis:py_utils",

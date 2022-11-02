@@ -25,14 +25,17 @@ import numpy as np
 from praxis import base_layer
 from praxis import decoder_utils
 from praxis import py_utils
+from praxis import pytypes
 from praxis import test_utils
 from praxis.layers import models
+from praxis.layers import resnets
 from praxis.layers import transformer_models
 
 NestedMap = py_utils.NestedMap
 BaseHParams = base_layer.BaseLayer.HParams
 instantiate = base_layer.instantiate
 LanguageModelType = transformer_models.LanguageModelType
+JTensor = pytypes.JTensor
 
 RANDOM = base_layer.RANDOM
 DECODE_CACHE = base_layer.DECODE_CACHE
@@ -53,7 +56,7 @@ class MockLM(base_layer.BaseLayer):
 
   def setup(self) -> None:
     p = self.hparams
-    self.logits = jnp.array(p.logits, dtype=jnp.float32)
+    self._logits = jnp.array(p.logits, dtype=jnp.float32)
 
   def __call__(self, *args: Any, **kwargs: Any) -> None:
     self.put_variable(DECODE_CACHE, 'time_step', 0)
@@ -66,7 +69,7 @@ class MockLM(base_layer.BaseLayer):
     del inputs
     ret = NestedMap()
     time_step = self.get_variable(DECODE_CACHE, 'time_step')
-    ret.logits = self.logits.at[time_step].get()
+    ret.logits = self._logits.at[time_step].get()
     self.put_variable(DECODE_CACHE, 'time_step', time_step + 1)
     return ret
 
@@ -88,8 +91,8 @@ class LanguageModelTest(test_utils.TestCase):
                   model_type=LanguageModelType.CAUSAL):
     p = models.LanguageModel.HParams(
         name='mock_lm',
-        decoder=decoder_p.clone(),
-        lm=MockLM.HParams(logits=logits),
+        decoder_tpl=decoder_p.clone(),
+        lm_tpl=MockLM.HParams(logits=logits),
         model_type=model_type)
     lang_model = instantiate(p)
     theta = NestedMap(lm=NestedMap())
@@ -106,7 +109,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_base_case(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 3
     p.min_prefix_len = 1
     p.fprop_for_prefix = fprop_for_prefix
@@ -192,7 +195,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_prefix(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 2
     p.fprop_for_prefix = fprop_for_prefix
@@ -239,7 +242,7 @@ class LanguageModelTest(test_utils.TestCase):
 
   @parameterized.parameters([True, False])
   def test_prefix_lm(self, fprop_for_prefix):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 2
     p.fprop_for_prefix = fprop_for_prefix
@@ -287,7 +290,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[5]], dtype=np.int32))
 
   def test_eos_terminate(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 6
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -316,7 +319,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[3]], dtype=np.int32))
 
   def test_eos_independent(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -350,7 +353,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[3], [4]], dtype=np.int32))
 
   def test_prefix_and_eos(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -396,7 +399,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[5], [4], [3]], dtype=np.int32))
 
   def test_prefix_and_eos_fprop_for_prefix(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 7
     p.max_decode_steps = 4
     p.min_prefix_len = 0
@@ -447,7 +450,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[6], [4], [3]], dtype=np.int32))
 
   def test_prefix_has_eos(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 4
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -483,7 +486,7 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[4], [4]], dtype=np.int32))
 
   def test_max_decode_steps(self):
-    p = models.LanguageModel.HParams().decoder
+    p = models.LanguageModel.HParams().decoder_tpl
     p.seqlen = 5
     p.min_prefix_len = 0
     p.eos_id = 2
@@ -603,10 +606,13 @@ class LanguageModelTest(test_utils.TestCase):
                            np.array([[5, 5], [4, 4], [3, 3]], dtype=np.int32))
 
   @parameterized.parameters(
-      (1),
-      (2),
+      (1, False),
+      (2, False),
+      (1, True),
+      (2, True),
   )
-  def test_sample_decoding_prefix_and_eos_fprop_for_prefix(self, k):
+  def test_sample_decoding_prefix_and_eos_fprop_for_prefix(
+      self, k, is_dynamic_temp):
     p = models.SampleDecoderHParams(
         fprop_for_prefix=True,
         seqlen=7,
@@ -645,6 +651,11 @@ class LanguageModelTest(test_utils.TestCase):
         paddings=jnp.zeros(shape=(3, 3), dtype=jnp.float32),
         prefix_lengths=jnp.array([2, 1, 1], dtype=jnp.int32),
     )
+
+    if is_dynamic_temp:
+      # Test if JTensor type temperature could work.
+      input_batch['temperature'] = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float32)
+
     results = self._run_decode(p, sample_logits, input_batch)
 
     # This is fixed by the prng seed provided.
@@ -720,6 +731,29 @@ class LanguageModelTest(test_utils.TestCase):
                  dtype=np.int32))
     self.assertArraysEqual(results.decode_lengths,
                            np.array([[5], [4], [3]], dtype=np.int32))
+
+
+class ClassifierModelTest(test_utils.TestCase):
+
+  @parameterized.parameters([2, 6])
+  def test_fprop(self, num_classes: int):
+
+    p = models.ClassificationModel.HParams(
+        name='classifier', network_tpl=resnets.ResNet.HParamsResNet5())
+    p.softmax_tpl.num_classes = num_classes
+    p.softmax_tpl.input_dims = 16
+
+    inputs = NestedMap(
+        image=jnp.zeros((1, 25, 25, 3), jnp.float32),
+        label_probs=jax.nn.one_hot(
+            jnp.array([0]), num_classes, dtype=jnp.float32))
+    model = instantiate(p)
+    with base_layer.JaxContext.new_context():
+      (metrics, _), _ = model.init_with_output(jax.random.PRNGKey(42), inputs)
+
+    self.assertContainsSubset(['accuracy', 'error'], metrics)
+    if num_classes > 5:
+      self.assertContainsSubset(['acc5', 'error5'], metrics)
 
 
 if __name__ == '__main__':

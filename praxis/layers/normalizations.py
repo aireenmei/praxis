@@ -69,12 +69,8 @@ def compute_moments(
 
   if base_layer.is_running_under_pmap():
     # Here the aggregated mean & variance is the true mean & variance of all
-    # workers' samples ONLY IF all pmap workers have the same number of
-    # elements to be normalized (e.g. have the same batch sizes). This
-    # implementation is like Flax's BatchNorm, but unlike PyTorch's
-    # SyncBatchNorm (which always computes true statistics of all samples).
-    # This difference may not matter according to Appendix A.6 of
-    # https://arxiv.org/abs/2105.07576.
+    # workers' samples even when they have different batch sizes. This
+    # property is like PyTorch's SyncBatchNorm, but unlike Flax's BatchNorm.
     sum_v = jax.lax.psum(sum_v, axis_name=PMAP_PARALLEL_AXIS_NAME)
     count_v = jax.lax.psum(count_v, axis_name=PMAP_PARALLEL_AXIS_NAME)
 
@@ -215,8 +211,8 @@ class BatchNorm(BaseNormalization):
       # The mean and variance used for normalization.
       norm_mean = self.get_var('moving_mean')
       norm_variance = self.get_var('moving_variance')
-      self.add_summary('moving_mean', norm_mean)
-      self.add_summary('moving_variance', norm_variance)
+      self.add_summary('moving_mean', norm_mean, verbosity=4)
+      self.add_summary('moving_variance', norm_variance, verbosity=4)
     else:
       rank = inputs.ndim
       reduce_over_dims = list(range(0, rank - 1))
@@ -236,10 +232,11 @@ class BatchNorm(BaseNormalization):
       self.update_var('moving_variance', new_moving_variance)
 
       # Add some summaries for visualization.
-      self.add_summary('mean', mean)
-      self.add_summary('variance', variance)
-      self.add_summary('moving_mean', self.get_var('moving_mean'))
-      self.add_summary('moving_variance', self.get_var('moving_variance'))
+      self.add_summary('mean', mean, verbosity=4)
+      self.add_summary('variance', variance, verbosity=4)
+      self.add_summary('moving_mean', self.get_var('moving_mean'), verbosity=4)
+      self.add_summary(
+          'moving_variance', self.get_var('moving_variance'), verbosity=4)
       if p.use_moving_avg_in_training:
         # Use the global statistics for normalization.
         norm_mean = self.get_var('moving_mean')
@@ -300,8 +297,8 @@ class LayerNorm(BaseNormalization):
       bias: Whether to use bias.
     """
     epsilon: float = 1e-6
-    scale: bool = True
-    bias: bool = True
+    use_scale: bool = True
+    use_bias: bool = True
 
   def setup(self) -> None:
     """Creates layer normalization variables."""
@@ -311,7 +308,7 @@ class LayerNorm(BaseNormalization):
     if p.mesh_shape is not None and wp.wt is None:
       # Simply replicate the weights.
       wp_scale = [-1]
-    if p.scale:
+    if p.use_scale:
       self.create_variable(
           'scale',
           WeightHParams(
@@ -322,7 +319,7 @@ class LayerNorm(BaseNormalization):
               collections=[
                   base_layer.WeightHParamsCollection.SKIP_LP_REGULARIZATION
               ]))
-    if p.bias:
+    if p.use_bias:
       wp_bias = wp_scale  # bias should use the same sharding as scale.
       self.create_variable(
           'bias',
@@ -353,9 +350,9 @@ class LayerNorm(BaseNormalization):
     mean = jnp.mean(inputs, axis=[-1], keepdims=True)
     var = jnp.mean(jnp.square(inputs - mean), axis=[-1], keepdims=True)
     normed_inputs = (inputs - mean) * jax.lax.rsqrt(var + self.hparams.epsilon)
-    if p.scale:
+    if p.use_scale:
       normed_inputs *= (1 + self.theta.scale)
-    if p.bias:
+    if p.use_bias:
       normed_inputs += self.theta.bias
     return normed_inputs
 
@@ -458,12 +455,14 @@ class GroupNorm(BaseNormalization):
       cumulative: If true, only normalize by current and previous time steps.
       input_rank: Rank of input. Only 3(BTD) and 4(NHWC) are supported.
       epsilon: Epsilon added when computing the rsqrt.
+      set_padded_output_to_zero: bool. whether to pad padding part to zero.
     """
     num_groups: int = 32
     min_group_size: int = 1
     cumulative: bool = False
     input_rank: Optional[int] = None
     epsilon: float = 0.001
+    set_padded_output_to_zero: bool = True
 
   def setup(self) -> None:
     """Initializes GroupNorm layer and checks parameters."""
@@ -493,14 +492,14 @@ class GroupNorm(BaseNormalization):
     self.create_variable('gamma', pc)
 
   @property
-  def group_size(self) -> int:
+  def _group_size(self) -> int:
     p = self.hparams
     return max(p.dim // p.num_groups, p.min_group_size)
 
   @property
-  def num_groups(self) -> int:
+  def _num_groups(self) -> int:
     p = self.hparams
-    return p.dim // self.group_size
+    return p.dim // self._group_size
 
   def _normalize(self, grouped_inputs: JTensor, group_mean: JTensor,
                  group_variance: JTensor) -> JTensor:
@@ -546,7 +545,7 @@ class GroupNorm(BaseNormalization):
 
     x = jnp.reshape(
         inputs,
-        list(inputs.shape[:-1]) + [self.num_groups, self.group_size])
+        list(inputs.shape[:-1]) + [self._num_groups, self._group_size])
     expanded_rank = p.input_rank + 1
     all_dims = list(range(expanded_rank))
     if paddings is None or not p.cumulative:
@@ -573,4 +572,10 @@ class GroupNorm(BaseNormalization):
           cumulative_axis=1,
           keepdims=True)
 
-    return self._normalize(x, group_mean, group_variance)
+    gn_output = self._normalize(x, group_mean, group_variance)
+    if p.set_padded_output_to_zero and paddings is not None:
+      expanded_paddings = jnp.reshape(
+          paddings,
+          list(inputs.shape[:2]) + [1] * (expanded_rank - 3))
+      gn_output *= 1.0 - expanded_paddings
+    return gn_output

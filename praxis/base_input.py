@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
 from absl import logging
 import jax
+from jax.experimental import maps
 from lingvo.core import cluster_factory
 from lingvo.core import datasource
 import numpy as np
@@ -36,11 +37,12 @@ NestedMap = py_utils.NestedMap
 NestedJTensor = pytypes.NestedJTensor
 Nested = pytypes.Nested
 NestedShapeDtypeStruct = pytypes.NestedShapeDtypeStruct
+NestedPartitionSpec = pytypes.NestedPartitionSpec
 instantiate = base_hyperparams.instantiate
 
 
 class BaseInput(base_hyperparams.BaseParameterizable):
-  """Base class for Jax input classes.
+  """Base class for Praxis input pipelines.
 
   During paxml's train, on each host an input instance will be
   created (instantiate(input_p)), and then get_next() is iteratively
@@ -55,12 +57,8 @@ class BaseInput(base_hyperparams.BaseParameterizable):
   training and eval data, please refer to the implementation of
   TFRecordBertInput at tasks/lm/input_generator.py.
 
-  If there is already an Lingvo TF input generator that one would like to
+  If there is already a Lingvo TF input generator that one would like to
   use directly, please use LingvoInputAdaptor below.
-
-  tf_graph_get_next() is an optional TF graph mode implementation of get_next
-  and returns output tensors and init ops. It's used when
-  experimental_remote_input is set.
   """
   _VALIDATE_BATCH_SIZE_NOT_NONE = True
 
@@ -88,9 +86,8 @@ class BaseInput(base_hyperparams.BaseParameterizable):
         many batches. Metrics over those batches will be aggregated and then
         reported.
       is_training: Whether or not this dataset is used for model traning.
-      experimental_remote_input: How to process inputs on remote hosts, when
-        there is a single controller. If set, it requires an implementation of
-        tf_graph_get_next().
+      experimental_remote_input: whether to process inputs on remote hosts, when
+        there is a single controller.
       batch_padding_size: The amount of right-padding applied to each invocation
         of get_next_padded(). Useful when the batch_size is smaller than the
         number of devices.
@@ -106,7 +103,7 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     reset_for_eval: bool = False
     eval_loop_num_batches: int = 1
     is_training: bool = False
-    experimental_remote_input: Optional[RemoteInput] = None
+    experimental_remote_input: bool = False
     batch_padding_size: int = 0
 
   @classmethod
@@ -126,29 +123,9 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     if re.fullmatch(r'[a-zA-Z0-9.:_-]+', name) is None:
       raise ValueError(f'Input hparams p.name string invalid: "{name}" '
                        'does not fully match "[a-zA-Z0-9._-]+".')
-    if hparams.experimental_remote_input:
-      if hparams.batch_padding_size > 0:
-        raise NotImplementedError('Remote input padding not implemented')
-      self._remote_input = hparams.experimental_remote_input.Instantiate(
-          input_fn=self.tf_graph_get_next)
-
-  def tf_graph_get_next(
-      self, host_id: int) -> tuple[Nested[tf.Tensor], Iterable[tf.Operation]]:
-    """TF graph mode implementation of get next.
-
-    Only need to implement this method when the subclass wants to support
-    experimental_remote_input.
-
-    Args:
-      host_id: An integer. The index of the host where to get the data. When
-        experimental_remote_input is true, hparams.infeed_host_index is the
-        index of the local device. Use host_id as infeed host index to get data
-        from a remote host.
-
-    Returns:
-      A tuple of nested output tensors and a list of initialization ops.
-    """
-    raise NotImplementedError
+    if hparams.experimental_remote_input and jax.process_count() > 1:
+      raise NotImplementedError(
+          'Remote input is not supported when there are multiple controllers.')
 
   def get_next(self) -> NestedJTensor:
     raise NotImplementedError
@@ -158,7 +135,7 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     pad_size = self.hparams.batch_padding_size
     if pad_size == 0:
       return unpadded
-    return tf.nest.map_structure(
+    return jax.tree_util.tree_map(
         lambda x: np.pad(x, [[0, pad_size]] + [[0, 0]] * (x.ndim - 1)),
         unpadded)
 
@@ -185,35 +162,63 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     """
     raise NotImplementedError
 
+  @classmethod
+  def reshard_for_pmap(cls, arrays: NestedJTensor) -> NestedJTensor:
+    """Reshards inputs for pmap.
 
-class RemoteInput(base_hyperparams.BaseParameterizable):
-  """Base class for remote input processing."""
+    This function reshards `arrays`, inputs returned by this input class, to be
+    suitable for pmap computation. The returned arrays are expected to have the
+    pmap device dimension as the 0th dimension and per-device batch dimension as
+    the 1st dimension. Input subclasses may override this to customize the
+    resharding implementations.
 
-  class HParams(base_hyperparams.BaseParameterizable.HParams):
-    """Hyper-parameters for RemoteInput."""
+    Args:
+      arrays: Inputs returned by this input class.
 
-  def __init__(self, hparams: RemoteInput.HParams,
-               input_fn: Callable[..., Any]) -> None:
-    super().__init__(hparams)
-    self._input_fn = input_fn
+    Returns:
+      Resharded inputs.
+    """
+    return jax.tree_util.tree_map(py_utils.reshard, arrays)
 
-  def get_next(self) -> pytypes.NestedJTensor:
-    raise NotImplementedError
+  @classmethod
+  def reshard_for_spmd(cls, arrays: NestedJTensor,
+                       global_shapes: NestedShapeDtypeStruct,
+                       global_mesh: maps.Mesh,
+                       pspecs: NestedPartitionSpec) -> NestedJTensor:
+    """Reshards inputs for pjit.
 
-  def reset(self) -> None:
-    raise NotImplementedError
+    This function reshards `arrays`, inputs returned by this input class, to be
+    suitable for pjit computation on the given mesh. The caller also provides
+    the expected global shapes and partition specs of the arrays to be returned.
+    The returned arrays are expected to have the global batch dimension as the
+    0th dimension and be sharded in the way specified by `pspecs`.Input
+    subclasses may override this to customize the resharding implementations.
+
+    Args:
+      arrays: Inputs returned by this input class.
+      global_shapes: Expected global shapes of `arrays` after resharding.
+      global_mesh: Global mesh for pjit computation.
+      pspecs: Expected partition specs for `arrays` after resharding.
+
+    Returns:
+      Resharded inputs.
+    """
+    py_utils.assert_same_shape_and_dtype(
+        global_shapes,
+        jax.tree_util.tree_map(py_utils.get_global_input_shape_dtype, arrays))
+    return py_utils.create_gda(arrays, global_shapes, global_mesh, pspecs)
 
 
 class LingvoInputAdaptor(BaseInput):
-  """Syntactic sugar for adapting a Lingvo style input for Jax.
+  """Syntactic sugar for adapting a Lingvo style input for Pax.
 
   This should be able to wrap any Lingvo TF input generator to be used in
-  Lingvo Jax. Remember to set `p.is_training=True` on the training dataset.
+  Pax. Remember to set `p.is_training=True` on the training dataset.
 
   Some usage caveats below.
 
   For eval, `p.num_samples` or other similar params like samples_per_summary are
-  completely ignored by Lingvo Jax. Caller should instead set `p.num_batches` to
+  completely ignored by Pax. Caller should instead set `p.num_batches` to
   (p.num_samples // batch_size) with `p.reset_for_eval=True` so that each eval
   step reads (approximately) one epoch of eval data. This might not be needed if
   the input already is finite (e.g. with p.repeat_count=1).
@@ -296,17 +301,17 @@ class LingvoInputAdaptor(BaseInput):
                                     hparams.cluster_do_eval)
     self._initialize()
 
-  def _update_file_random_seed(self, infeed_host_index) -> None:
+  def _update_file_random_seed(self) -> None:
     """Updates file random seed to use different seeds for different hosts."""
     p = self.hparams
     if hasattr(p.input, 'file_random_seed') and p.input.file_random_seed:
       # Make sure each host uses a different random seed.
-      p.input.file_random_seed += infeed_host_index
+      p.input.file_random_seed += p.infeed_host_index
 
   def _initialize(self) -> None:
     """Initializes the relevant fields of this adaptor input."""
     p = self.hparams
-    self._update_file_random_seed(p.infeed_host_index)
+    self._update_file_random_seed()
     # We make self.input public so that users can access its methods like
     # IdsToStrings if needed.
     with py_utils.infeed_context_scope(
@@ -320,34 +325,18 @@ class LingvoInputAdaptor(BaseInput):
       # call eagerly. Using tf.function may result in returning duplicate
       # batches.
       self._get_next_fn = self._get_batch
-      if p.experimental_remote_input:
-        raise NotImplementedError(
-            'Distributed input processing for datasource is not supported yet.')
     else:
       self._get_next_fn = tf.function(self._get_batch)
     self._num_batches_produced = 0
 
-  def _get_batch(self, host_index: Optional[int] = None) -> NestedMap:
+  def _get_batch(self) -> NestedMap:
     p = self.hparams
-    if not p.experimental_remote_input and host_index is not None:
-      raise ValueError(
-          'Unexpected host index when experimental_remote_input is false.')
-    infeed_host_index = (
-        p.infeed_host_index if host_index is None else host_index)
     with py_utils.infeed_context_scope(
-        infeed_host_index=infeed_host_index,
+        infeed_host_index=p.infeed_host_index,
         num_infeed_hosts=p.num_infeed_hosts), self._cluster:
       ret = self.input.GetPreprocessedInputBatch()
     # Remove unsupported string (byte) array from input.
     return ret.Filter(lambda v: v.dtype != tf.string)
-
-  def tf_graph_get_next(
-      self, host_id: int) -> tuple[Nested[tf.Tensor], Iterable[tf.Operation]]:
-    self._update_file_random_seed(host_id)
-    ret = self._get_batch(host_id)
-    batch_size = tf.nest.flatten(ret)[0].shape[0]
-    ret.eval_sample_weights = tf.ones([batch_size], tf.float32)
-    return ret, []
 
   def get_next(self) -> NestedJTensor:
     p = self.hparams
@@ -358,13 +347,10 @@ class LingvoInputAdaptor(BaseInput):
             op=None,
             message=f'num_batches exceeding {self._num_batches_produced}')
       self._num_batches_produced += 1
-    if p.experimental_remote_input:
-      ret = self._remote_input.get_next()
-    else:
-      ret = self._get_next_fn()
-      ret = tf.nest.map_structure(lambda x: x.numpy(), ret)
-      batch_size = tf.nest.flatten(ret)[0].shape[0]
-      ret.eval_sample_weights = np.ones([batch_size], np.float32)
+    ret = self._get_next_fn()
+    ret = jax.tree_util.tree_map(lambda x: x.numpy(), ret)
+    batch_size = jax.tree_util.tree_leaves(ret)[0].shape[0]
+    ret.eval_sample_weights = np.ones([batch_size], np.float32)
     return ret
 
   def reset(self) -> None:
@@ -376,8 +362,6 @@ class LingvoInputAdaptor(BaseInput):
       return
     # reinstantiate the input and retrace self._get_batch.
     self._initialize()
-    if self.hparams.experimental_remote_input:
-      self._remote_input.reset()
 
   def ids_to_strings(self,
                      ids: pytypes.NpTensor,
@@ -422,7 +406,8 @@ class LingvoInputAdaptorNewBatchSize(LingvoInputAdaptor):
   def __init__(self, hparams: LingvoInputAdaptor.HParams):
     super().__init__(hparams)
     self._current_batch = super().get_next()
-    self._inner_batch_size = tf.nest.flatten(self._current_batch)[0].shape[0]
+    self._inner_batch_size = jax.tree_util.tree_leaves(
+        self._current_batch)[0].shape[0]
     logging.info(
         'The wrapped Lingvo input has batch size %d, the actual input '
         'has batch size %d.', self._inner_batch_size, hparams.batch_size)
@@ -442,7 +427,7 @@ class LingvoInputAdaptorNewBatchSize(LingvoInputAdaptor):
       start = self._current_batch_index
       return b[start:start + p.batch_size]
 
-    ret = tf.nest.map_structure(_get_subrows, self._current_batch)
+    ret = jax.tree_util.tree_map(_get_subrows, self._current_batch)
     self._current_batch_index += p.batch_size
     return ret
 
@@ -476,6 +461,10 @@ class LingvoEvalAdaptor(LingvoInputAdaptor):
   _VALIDATE_BATCH_SIZE_NOT_NONE = True
   _VALIDATE_BATCH_SIZE_NONE = False
 
+  @classmethod
+  def get_batch_size(cls, hparams: LingvoInputAdaptor.HParams) -> int:
+    return hparams.batch_size
+
   def __init__(self, hparams: LingvoInputAdaptor.HParams):
     super().__init__(hparams)
     if hparams.is_training:
@@ -486,15 +475,12 @@ class LingvoEvalAdaptor(LingvoInputAdaptor):
     self._dataset = self._get_dataset()
     self._iter = self._dataset.as_numpy_iterator()
 
-  def _update_file_random_seed(self, infeed_host_index: int) -> None:
+  def _update_file_random_seed(self) -> None:
     """Updates file random seed.
 
     This overrides LingvoInputAdaptor._update_file_random_seed where each host
     is assigned a different file random seed. It does nothing to make sure every
     host uses the same file random seed in hparams.input.
-
-    Args:
-      infeed_host_index: index of this infeed host.
     """
     pass
 
@@ -538,7 +524,7 @@ class LingvoEvalAdaptor(LingvoInputAdaptor):
         new_data = super().get_next()
       except (tf.errors.OutOfRangeError, StopIteration):
         break
-      data_tensor = tf.nest.map_structure(
+      data_tensor = jax.tree_util.tree_map(
           lambda x, y: tf.concat([x, y], axis=0), data_tensor, new_data)
     ds = tf.data.Dataset.from_tensor_slices(data_tensor)
     ds = self._pad(ds)
@@ -553,16 +539,134 @@ class LingvoEvalAdaptor(LingvoInputAdaptor):
     self._iter = self._dataset.as_numpy_iterator()
 
 
-class MultiStreamInput(BaseInput):
+class LingvoLazyEvalAdaptor(LingvoInputAdaptor):
+  """A similar adapter as LingvoEvalAdaptor, but not load all data to memory.
+
+  LingvoLazyEvalAdaptor helps multi-host evaluation to get the same set of
+  examples as the single-host evaluation gets, by returning data in a sharded
+  manner. The main difference from `LingvoEvalAdaptor` is that this class
+  (`LingvoLazyEvalAdaptor`) does NOT read the whole dataset into memory. This
+  can be helpful if the eval set is quite large.
+
+  We make the following assumptions on the underlying Lingvo input p.input:
+  * it returns the entire data in a deterministic manner;
+  * it knows the number of samples in p.input.num_samples;
+  * it has a feature named `eval_sample_weights` to represent the validity of
+      each sample, 1 for valid and 0 for invalid;
+  * it repeats after all samples are exhausted (this requirement can be easily
+      lifted in the future if necessary).
+
+  The batch_size is handled by the underlying Lingvo input: p.input.batch_size.
+
+  Example usage:
+      input_p.batch_size = 4
+      p = LingvoLazyEvalAdaptor.HParams(input_p)
+  """
+  _VALIDATE_BATCH_SIZE_NOT_NONE = False
+  _VALIDATE_BATCH_SIZE_NONE = True
+
+  def __init__(self, hparams: LingvoInputAdaptor.HParams):
+    super().__init__(hparams)
+    if hparams.is_training:
+      raise ValueError('LingvoLazyEvalAdaptor requires p.is_traing=False.')
+    if not hparams.reset_for_eval:
+      raise ValueError('LingvoLazyEvalAdaptor requires p.reset_for_eval=True.')
+    if hparams.infeed_host_index >= hparams.num_infeed_hosts:
+      raise ValueError('Must have infeed_host_index < num_infeed_hosts')
+    if (not isinstance(hparams.input.batch_size, int) or
+        hparams.input.batch_size <= 0):
+      raise ValueError('Must have positive batch_size in the underlying input: '
+                       f'get {hparams.input.batch_size} instead.')
+    self.batch_size = self.get_batch_size(hparams)
+    # Global batch size across all hosts
+    global_batch_size = hparams.num_infeed_hosts * self.batch_size
+    # Global number of samples across all hosts
+    global_num_samples = hparams.input.num_samples
+    # Number of batches each host should at least have
+    num_batches = hparams.input.num_samples // global_batch_size
+    # Number of samples each host should at least have
+    num_samples = num_batches * self.batch_size
+    # The remaining samples after distributing evenly across hosts
+    num_samples_remainder = global_num_samples - num_batches * global_batch_size
+    # One more batch to handle the remaining samples.
+    if num_samples_remainder > 0:
+      num_batches += 1
+    # Number of hosts which handle a full batch for the remaining samples.
+    num_full_batches_remainder = num_samples_remainder // self.batch_size
+    # Number of samples less than a full batch, assigned to the last host.
+    num_samples_remainder -= num_full_batches_remainder * self.batch_size
+    if hparams.infeed_host_index < num_full_batches_remainder:
+      # These hosts need to handle a full batch for the remaining samples.
+      num_samples += self.batch_size
+    elif hparams.infeed_host_index == num_full_batches_remainder:
+      # This host needs to handle a partial (possibly empty) batch for the
+      # remaining samples.
+      num_samples += num_samples_remainder
+    self._num_samples = num_samples
+    self.num_batches = num_batches
+    self.reset()
+
+  def _update_file_random_seed(self) -> None:
+    """Updates file random seed.
+
+    This overrides LingvoInputAdaptor._update_file_random_seed where each host
+    is assigned a different file random seed. It does nothing to make sure every
+    host uses the same file random seed in hparams.input.
+    """
+    pass
+
+  @property
+  def num_samples(self) -> int:
+    return self._num_samples
+
+  def get_next(self):
+    # If this host has emitted enough number of batches, it should stop. Please
+    # note that a host may not have emitted enough batches even if it has
+    # emitted all its samples. For example, there are 2 hosts with batch size 1,
+    # and there are totally only 1 sample. In this case, the first host has 1
+    # sample and the second host has 0 samples. But the second host should still
+    # emit 1 batch, with all invalid samples.
+    if self._num_batches_emitted == self.num_batches:
+      raise tf.errors.OutOfRangeError(
+          node_def=None,
+          op=None,
+          message=f'{self.num_batches} batches have been exhausted.')
+    # Number of remaining samples this host has.
+    remaining_samples = self._num_samples - self._num_examples_emitted
+    ret = super().get_next()
+    self._num_batches_emitted += 1
+    # Number of valid samples this batch has.
+    num_valid_samples = min(self.batch_size, remaining_samples)
+    if 'eval_sample_weights' not in ret:
+      raise ValueError('eval_sample_weights must be included in the data')
+    # Sets the weight of invalid samples to 0.
+    ret.eval_sample_weights[num_valid_samples:] = 0.
+    self._num_examples_emitted += num_valid_samples
+    remaining_samples -= num_valid_samples
+    # If there are still remaining samples in this host, skip n-1 batches which
+    # belong to other hosts.
+    if remaining_samples > 0:
+      for _ in range(self.hparams.num_infeed_hosts - 1):
+        super().get_next()
+    return ret
+
+  def reset(self):
+    super().reset()
+    # Skips k batches which belong to other hosts.
+    for _ in range(self.hparams.infeed_host_index):
+      super().get_next()
+    self._num_examples_emitted = 0
+    self._num_batches_emitted = 0
+
+
+class MultiInput(BaseInput):
   """Wraps children inputs and outputs a combined batch at each step.
 
-  During Lingvo Jax's train, on each host input instances for all children
+  During Pax's train, on each host input instances for all children
   inputs will be created (instantiate(input_p)), and then get_next() is
   iteratively called for each child in eager mode to generate one batch of
   data for each step. Each batch will contain a batch from all children
   input generators nested into a NestedMap.
-
-  NOTE: Batch sizes need to be equal across all input streams to work with pmap.
   """
   _VALIDATE_BATCH_SIZE_NOT_NONE = False  # Validated separately for children.
   _VALIDATE_BATCH_SIZE_NONE = True  # Can't set batch size for wrapper.
@@ -571,25 +675,29 @@ class MultiStreamInput(BaseInput):
     """Hyper-parameters associated with this Input class.
 
     Attributes:
-      input_streams: Dict from stream names to input generator parameter
-        definitions for each stream. Input generators need to implement
+      input_to_params: Dict from input names to input generator parameter
+        definitions for each input. Input generators need to implement
         BaseInput.
-      default_stream: Default input stream to use for ids_to_strings or other
+      default_input: Default input to use for ids_to_strings or other
         input generator methods.
     """
-    input_streams: Dict[str, BaseInput.HParams] = None
-    default_stream: str = None
+    input_to_params: Dict[str, BaseInput.HParams] = None
+    default_input: str = None
 
   @classmethod
-  def get_batch_size(cls, hparams: MultiStreamInput.HParams) -> int:
-    assert hparams.input_streams
-    first = list(hparams.input_streams.values())[0]
+  def get_batch_size(cls, hparams: MultiInput.HParams) -> int:
+    assert hparams.input_to_params
+    logging.warning(
+        'get_batch_size for MultiInput only returns batch size for the first '
+        'input. This might be different from batch sizes for other inputs.'
+    )
+    first = list(hparams.input_to_params.values())[0]
     return first.cls.get_batch_size(first)
 
-  def __init__(self, hparams: MultiStreamInput.HParams) -> None:
+  def __init__(self, hparams: MultiInput.HParams) -> None:
     if self._VALIDATE_BATCH_SIZE_NONE and hparams.batch_size is not None:
-      raise ValueError('MultiStreamInput does not support p.batch_size. '
-                       'Please specify batch size on each child input stream '
+      raise ValueError('MultiInput does not support p.batch_size. '
+                       'Please specify batch size on each child input '
                        'separately.')
     if not hparams.name:
       hparams.name = 'train' if hparams.is_training else 'input'
@@ -598,41 +706,41 @@ class MultiStreamInput(BaseInput):
     if re.fullmatch(r'[a-zA-Z0-9.:_-]+', name) is None:
       raise ValueError(f'Input hparams p.name string invalid: "{name}" '
                        'does not fully match "[a-zA-Z0-9._-]+".')
-    if hparams.input_streams is None:
-      raise ValueError('Need to define input streams.')
+    if hparams.input_to_params is None:
+      raise ValueError('Need to define inputs.')
 
-    if hparams.reset_for_eval and len(hparams.input_streams) > 1:
+    if hparams.reset_for_eval and len(hparams.input_to_params) > 1:
       raise ValueError(
-          'Only 1 input stream can be specified when using reset_for_eval.')
+          'Only 1 input can be specified when using reset_for_eval.')
 
-    self._input_streams = {}
-    for stream_name, stream_params in hparams.input_streams.items():
+    self._inputs = {}
+    for input_name, input_params in hparams.input_to_params.items():
       # Overriding params for children to match parent.
-      stream_params.num_infeed_hosts = hparams.num_infeed_hosts
-      stream_params.infeed_host_index = hparams.infeed_host_index
-      stream_params.is_training = hparams.is_training
-      stream_params.reset_for_eval = hparams.reset_for_eval
-      stream_params.eval_loop_num_batches = hparams.eval_loop_num_batches
-      stream_params.name = hparams.name + '_' + stream_name
+      input_params.num_infeed_hosts = hparams.num_infeed_hosts
+      input_params.infeed_host_index = hparams.infeed_host_index
+      input_params.is_training = hparams.is_training
+      input_params.reset_for_eval = hparams.reset_for_eval
+      input_params.eval_loop_num_batches = hparams.eval_loop_num_batches
+      input_params.name = hparams.name + '_' + input_name
 
-      self._input_streams[stream_name] = instantiate(stream_params)
+      self._inputs[input_name] = instantiate(input_params)
 
   def get_next(self) -> NestedJTensor:
-    stream_batches = {}
-    for stream_name, stream in self._input_streams.items():
-      stream_batches[stream_name] = stream.get_next()
-    return NestedMap(stream_batches)
+    input_batches = {}
+    for input_name, input_gen in self._inputs.items():
+      input_batches[input_name] = input_gen.get_next()
+    return NestedMap(input_batches)
 
   def reset(self) -> None:
-    for _, stream in self._input_streams.items():
-      stream.reset()
+    for _, input_gen in self._inputs.items():
+      input_gen.reset()
 
   def ids_to_strings(self,
                      ids: pytypes.NpTensor,
                      lengths: pytypes.NpTensor,
                      key: Optional[str] = None,
-                     stream: Optional[str] = None) -> Sequence[str]:
-    """Converts int ids into strings using a particular input stream.
+                     input_name: Optional[str] = None) -> Sequence[str]:
+    """Converts int ids into strings using a particular input.
 
     Args:
       ids: A matrix of shape [batch, seqlen], each row is a sequence to be
@@ -643,14 +751,14 @@ class MultiStreamInput(BaseInput):
         or target. This is useful for example in a sequence model where the
         source and targets have different tokenizers. For the source corpus the
         key should be `src` while for the target corpus the key should be `tgt`.
-      stream: Argument specifying which input stream's ids_to_strings to call.
+      input_name: Argument specifying which input's ids_to_strings to call.
 
     Returns:
       A list strings of shape [batch]. The converted texts.
     """
-    if stream is None:
-      stream = self.hparams.default_stream
-    return self._input_streams[stream].ids_to_strings(ids, lengths, key)
+    if input_name is None:
+      input_name = self.hparams.default_input
+    return self._inputs[input_name].ids_to_strings(ids, lengths, key)
 
 
 class BaseInputSpecsProvider(

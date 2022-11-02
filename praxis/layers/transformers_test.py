@@ -50,7 +50,7 @@ class TransformersTest(test_utils.TestCase):
 
   @parameterized.parameters(*list(itertools.product([True, False], repeat=3)))
   def test_transformer_layer(self, mask_self_attention, packed_input,
-                             cross_attention):
+                             use_cross_attention):
     p = transformers.Transformer.HParams(
         name='jax_transformer_layer',
         input_dims=32,
@@ -58,7 +58,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=8,
         mask_self_attention=mask_self_attention,
         packed_input=packed_input,
-        cross_attention=cross_attention)
+        use_cross_attention=use_cross_attention)
     seq_len = np.random.randint(10, 32)
     batch_size = 10
     transformer_layer = instantiate(p)
@@ -92,7 +92,7 @@ class TransformersTest(test_utils.TestCase):
     tf_cross_inputs = None
     tf_cross_paddings = None
     tf_cross_segment_mask = None
-    if cross_attention:
+    if use_cross_attention:
       cross_seq_len = np.random.randint(10, 128)
       npy_cross_inputs = np.random.normal(
           1.0, 0.5, [batch_size, cross_seq_len, p.input_dims]).astype('float32')
@@ -134,7 +134,7 @@ class TransformersTest(test_utils.TestCase):
     # Modify initial_vars to use TF compatible params
     tf_initial_vars = py_utils.NestedMap.FromNestedDict(initial_vars[PARAMS])
     tf_initial_vars = test_utils.replace_jax_attention_vars_to_tf(
-        tf_initial_vars, cross_attention)
+        tf_initial_vars, use_cross_attention)
     tf_initial_vars = test_utils.to_tf_nmap(tf_initial_vars)
     logging.info('tf_initial_vars in transformer layer = %s', tf_initial_vars)
     tf_p = batch_major_attention.TransformerLayer.Params().Set(
@@ -143,7 +143,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=p.num_heads,
         mask_self_atten=mask_self_attention,
         packed_input=packed_input,
-        has_aux_atten=cross_attention)
+        has_aux_atten=use_cross_attention)
     tf_p.tr_fflayer_tpl.hidden_dim = p.hidden_dims
     tf_p.tr_fflayer_tpl.fflayer_tpl.batch_norm = False
     tf_p.tr_fflayer_tpl.fflayer_tpl.has_bias = True
@@ -172,7 +172,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=4,
         mask_self_attention=True,
         packed_input=packed_input,
-        cross_attention=cross_attention)
+        use_cross_attention=cross_attention)
     p.tr_atten_tpl.dconv_qkv = dconv_qkv
     p.tr_atten_tpl.use_rotary_position_emb = use_rotary_position_emb
     if cross_attention:
@@ -289,7 +289,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=num_heads,
         mask_self_attention=True,
         packed_input=packed_input,
-        cross_attention=True)
+        use_cross_attention=True)
     seq_len = 5
     batch_size = 4
     npy_inputs = np.random.normal(
@@ -414,7 +414,7 @@ class TransformersTest(test_utils.TestCase):
         input_dims=8,
         hidden_dims=32,
         num_heads=4,
-        cross_attention=True,
+        use_cross_attention=True,
         mask_self_attention=True)
     # Enable cross attention.
     p.cross_atten_tpl = copy.deepcopy(p.tr_atten_tpl)
@@ -436,7 +436,7 @@ class TransformersTest(test_utils.TestCase):
         input_dims=8,
         hidden_dims=32,
         num_heads=4,
-        cross_attention=True,
+        use_cross_attention=True,
         mask_self_attention=True)
     # Enable cross attention.
     p.cross_atten_tpl = copy.deepcopy(p.tr_atten_tpl)
@@ -471,7 +471,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=1,
         mask_self_attention=True,
         packed_input=True,
-        cross_attention=False,
+        use_cross_attention=False,
         num_experts=4,
         num_groups=1,
         moe_layers=[0])
@@ -489,7 +489,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=block_p.num_heads,
         mask_self_attention=block_p.mask_self_attention,
         packed_input=block_p.packed_input,
-        cross_attention=block_p.cross_attention,
+        use_cross_attention=block_p.use_cross_attention,
         num_experts=block_p.num_experts,
         num_groups=block_p.num_groups,
         moe_layers=[0])
@@ -582,7 +582,7 @@ class TransformersTest(test_utils.TestCase):
   @absltest.SkipTest
   @parameterized.parameters(*list(itertools.product([True, False], repeat=3)))
   def test_transformer_moe_dense_layer(self, mask_self_attention, packed_input,
-                                       cross_attention):
+                                       use_cross_attention):
     # Comparing scan over blocks of layers and regular loop
     block_p = transformers.StackedTransformer.HParams(
         name='transformer_block',
@@ -592,7 +592,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=1,
         mask_self_attention=mask_self_attention,
         packed_input=packed_input,
-        cross_attention=cross_attention,
+        use_cross_attention=use_cross_attention,
         num_experts=4,
         num_groups=1,
         moe_layers=[0])
@@ -610,7 +610,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=block_p.num_heads,
         mask_self_attention=block_p.mask_self_attention,
         packed_input=block_p.packed_input,
-        cross_attention=block_p.cross_attention,
+        use_cross_attention=block_p.use_cross_attention,
         num_experts=block_p.num_experts,
         num_groups=block_p.num_groups,
         moe_layers=[0])
@@ -642,7 +642,7 @@ class TransformersTest(test_utils.TestCase):
     cross_inputs = None
     cross_paddings = None
     cross_segment_mask = None
-    if cross_attention:
+    if use_cross_attention:
       cross_seq_len = np.random.randint(10, 64)
       npy_cross_inputs = np.random.normal(
           1.0, 0.5,
@@ -712,7 +712,7 @@ class TransformersTest(test_utils.TestCase):
 
   @parameterized.parameters(*list(itertools.product([True, False], repeat=3)))
   def test_stacked_transformer_layer(self, mask_self_attention, packed_input,
-                                     cross_attention):
+                                     use_cross_attention):
     p = transformers.StackedTransformer.HParams(
         name='jax_stacked_transformer_layer',
         model_dims=16,
@@ -721,7 +721,7 @@ class TransformersTest(test_utils.TestCase):
         mask_self_attention=mask_self_attention,
         num_layers=4,
         packed_input=packed_input,
-        cross_attention=cross_attention)
+        use_cross_attention=use_cross_attention)
     seq_len = np.random.randint(10, 32)
     batch_size = 10
     stacked_transformer_layer = instantiate(p)
@@ -750,7 +750,7 @@ class TransformersTest(test_utils.TestCase):
     tf_cross_inputs = None
     tf_cross_paddings = None
     tf_cross_segment_mask = None
-    if cross_attention:
+    if use_cross_attention:
       cross_seq_len = np.random.randint(10, 64)
       npy_cross_inputs = np.random.normal(
           1.0, 0.5, [batch_size, cross_seq_len, p.model_dims]).astype('float32')
@@ -801,7 +801,7 @@ class TransformersTest(test_utils.TestCase):
       jax_initial_vars = initial_vars[PARAMS][x_layer_key]
       tf_layer_vars = py_utils.NestedMap.FromNestedDict(jax_initial_vars)
       tf_layer_vars = test_utils.replace_jax_attention_vars_to_tf(
-          tf_layer_vars, cross_attention)
+          tf_layer_vars, use_cross_attention)
       tf_initial_vars.x_layers.append(tf_layer_vars)
     tf_initial_vars = test_utils.to_tf_nmap(tf_initial_vars)
     logging.info('tf_initial_vars in transformer layer = %s', initial_vars)
@@ -813,7 +813,7 @@ class TransformersTest(test_utils.TestCase):
         mask_self_atten=mask_self_attention,
         num_layers=p.num_layers,
         packed_input=packed_input,
-        has_aux_atten=cross_attention)
+        has_aux_atten=use_cross_attention)
     tf_p.transformer_layer_params_tpl.tr_fflayer_tpl.fflayer_tpl.batch_norm = (
         False)
     tf_p.transformer_layer_params_tpl.tr_fflayer_tpl.fflayer_tpl.has_bias = True
@@ -840,7 +840,7 @@ class TransformersTest(test_utils.TestCase):
 
   @parameterized.parameters(*list(itertools.product([True, False], repeat=3)))
   def test_repeated_stacked_xformer_layer(self, mask_self_attention,
-                                          packed_input, cross_attention):
+                                          packed_input, use_cross_attention):
     model_dims = 16
     num_layers = 4
     p1 = transformers.StackedTransformer.HParams(
@@ -851,7 +851,7 @@ class TransformersTest(test_utils.TestCase):
         mask_self_attention=mask_self_attention,
         num_layers=num_layers,
         packed_input=packed_input,
-        cross_attention=cross_attention)
+        use_cross_attention=use_cross_attention)
     p1_one_layer = copy.deepcopy(p1)
     p1_one_layer.num_layers = 1
     p2 = transformers.StackedTransformerRepeated.HParams(
@@ -874,7 +874,7 @@ class TransformersTest(test_utils.TestCase):
     cross_inputs = None
     cross_paddings = None
     cross_segment_mask = None
-    if cross_attention:
+    if use_cross_attention:
       cross_seq_len = np.random.randint(10, 64)
       npy_cross_inputs = np.random.normal(
           1.0, 0.5, [batch_size, cross_seq_len, model_dims]).astype('float32')
@@ -951,6 +951,69 @@ class TransformersTest(test_utils.TestCase):
           cross_segment_mask=cross_segment_mask)
     self.assertAllClose(outputs, outputs_repeated, atol=1e-5)
 
+  def test_repeated_stacked_xformer_layer(self):
+    model_dims = 16
+    num_layers = 4
+    p1 = transformers.StackedTransformer.HParams(
+        name='jax_stacked_transformer_layer',
+        model_dims=model_dims,
+        hidden_dims=64,
+        num_heads=8,
+        mask_self_attention=False,
+        num_layers=num_layers,
+        packed_input=False,
+        use_cross_attention=False)
+    p2 = copy.deepcopy(p1)
+    p2.name = 'jax_stacked_transformer_layer_list_tpl'
+    p2.transformer_layer_params_tpl = [
+        transformers.Transformer.HParams() for _ in range(4)
+    ]
+    seq_len = np.random.randint(10, 32)
+    batch_size = 10
+    npy_inputs = np.random.normal(
+        1.0, 0.5, [batch_size, seq_len, model_dims]).astype('float32')
+    inputs = jnp.asarray(npy_inputs)
+    npy_paddings = np.random.randint(0, 1,
+                                     [batch_size, seq_len]).astype('float32')
+    paddings = jnp.asarray(npy_paddings)
+    segment_mask = None
+    cross_inputs = None
+    cross_paddings = None
+    cross_segment_mask = None
+
+    with base_layer.JaxContext.new_context():
+      stacked_transformer_layer_1 = instantiate(p1)
+      stacked_transformer_layer_2 = instantiate(p2)
+      prng_key = jax.random.PRNGKey(seed=123)
+      initial_vars = stacked_transformer_layer_1.init(
+          prng_key,
+          inputs,
+          paddings,
+          segment_mask=segment_mask,
+          cross_inputs=cross_inputs,
+          cross_paddings=cross_paddings,
+          cross_segment_mask=cross_segment_mask)
+
+      outputs_1 = stacked_transformer_layer_1.apply(
+          initial_vars,
+          inputs,
+          paddings,
+          segment_mask=segment_mask,
+          cross_inputs=cross_inputs,
+          cross_paddings=cross_paddings,
+          cross_segment_mask=cross_segment_mask)
+
+      outputs_2 = stacked_transformer_layer_2.apply(
+          initial_vars,
+          inputs,
+          paddings,
+          segment_mask=segment_mask,
+          cross_inputs=cross_inputs,
+          cross_paddings=cross_paddings,
+          cross_segment_mask=cross_segment_mask)
+
+    self.assertAllClose(outputs_1, outputs_2, atol=1e-5)
+
   @parameterized.parameters(*list(itertools.product([True, False], repeat=5)))
   def test_stacked_transformer_layer_extendstep(self, packed_input,
                                                 cross_attention, combine_qkv,
@@ -969,7 +1032,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=2,
         mask_self_attention=True,
         packed_input=packed_input,
-        cross_attention=cross_attention,
+        use_cross_attention=cross_attention,
         num_layers=num_layers)
     p.transformer_layer_params_tpl.tr_atten_tpl.combine_qkv = combine_qkv
     p.transformer_layer_params_tpl.tr_atten_tpl.dconv_qkv = dconv_qkv
@@ -1094,6 +1157,92 @@ class TransformersTest(test_utils.TestCase):
     np_decoder_outputs = test_utils.to_np(decoder_out_transposed) * non_pad
     self.assertAllClose(np_fprop_outputs, np_decoder_outputs, atol=1e-5)
 
+  @parameterized.parameters(*list(itertools.product([True, False], repeat=2)))
+  def test_stacked_transformer_layer_extend_n_step(self, combine_qkv,
+                                                   use_rotary_position_emb):
+    num_layers = 2
+    model_dims = 8
+    hidden_dims = 32
+    num_heads = 2
+
+    layer_params = transformers.StackedTransformer.HParams()
+    p = layer_params.set(
+        name='jax_transformer_layer',
+        model_dims=model_dims,
+        hidden_dims=hidden_dims,
+        num_heads=num_heads,
+        mask_self_attention=True,
+        packed_input=False,
+        use_cross_attention=False,
+        num_layers=num_layers)
+    p.transformer_layer_params_tpl.tr_atten_tpl = attentions.DotProductAttentionWithLPB.HParams(
+        input_dim=model_dims,
+        hidden_dim=hidden_dims,
+        num_heads=num_heads,
+        dim_per_head=4 if use_rotary_position_emb else None,
+        atten_logit_cap=20.0,
+        combine_qkv=combine_qkv,
+        dconv_qkv=False,
+        use_rotary_position_emb=use_rotary_position_emb)
+
+    p_copy = copy.deepcopy(p)
+    p_copy.num_layers = 1
+    p = transformers.StackedTransformerRepeated.HParams()
+    p.name = 'jax_transformer_repeated_layer'
+    p.block = p_copy
+    p.x_times = num_layers
+
+    seq_len = 4
+    batch_size = 4
+    npy_inputs = np.random.normal(
+        1.0, 0.5, [batch_size, seq_len, model_dims]).astype('float32')
+    inputs = jnp.asarray(npy_inputs)
+    npy_paddings = np.zeros([batch_size, seq_len]).astype('float32')
+    paddings = jnp.asarray(npy_paddings)
+    ninf = py_utils.get_large_negative_number(jnp.float32)
+    segment_mask = jnp.stack([
+        jnp.array([[0, ninf, ninf, ninf], [0, 0, ninf, ninf], [0, 0, 0, ninf],
+                   [0, 0, 0, 0]],
+                  dtype=jnp.float32)
+    ] * batch_size)
+    segment_mask = segment_mask[:, jnp.newaxis, :, :]
+    segment_pos = jnp.stack([jnp.arange(seq_len)] * batch_size)
+
+    prng_key = jax.random.PRNGKey(seed=123)
+    with base_layer.JaxContext.new_context():
+      repeat_transformer_layer = instantiate(p)
+      initial_vars = repeat_transformer_layer.init(
+          prng_key,
+          inputs,
+          paddings,
+          segment_pos=segment_pos,
+          segment_mask=segment_mask)
+      fprop_outputs = repeat_transformer_layer.apply(
+          initial_vars,
+          inputs,
+          paddings,
+          segment_pos=segment_pos,
+          segment_mask=segment_mask)
+      _, decoder_state = repeat_transformer_layer.apply(
+          initial_vars,
+          jnp.zeros_like(inputs),
+          jnp.ones_like(paddings),
+          segment_mask=segment_mask,
+          mutable=[DECODE_CACHE])
+
+      updated_vars = py_utils.MergeDictsWithValueCheck(decoder_state,
+                                                       initial_vars)
+      encoded, _ = repeat_transformer_layer.apply(
+          updated_vars,
+          inputs=inputs,
+          time_step=0,
+          segment_pos=segment_pos,
+          atten_mask=segment_mask,
+          method=repeat_transformer_layer.extend_step,
+          mutable=[DECODE_CACHE])
+
+    self.assertAllClose(fprop_outputs, encoded, atol=1e-5)
+
   @parameterized.named_parameters(
       {
           'testcase_name': 'ReLU',
@@ -1171,7 +1320,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=8,
         mask_self_attention=True,
         packed_input=True,
-        cross_attention=False,
+        use_cross_attention=False,
         norm_policy=norm_policy)
     seq_len = np.random.randint(10, 32)
     batch_size = 10
@@ -1211,7 +1360,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=8,
         mask_self_attention=True,
         packed_input=True,
-        cross_attention=True,
+        use_cross_attention=True,
         norm_policy=norm_policy)
     seq_len = np.random.randint(10, 32)
     batch_size = 10
@@ -1261,7 +1410,7 @@ class TransformersTest(test_utils.TestCase):
         num_heads=8,
         mask_self_attention=True,
         packed_input=True,
-        cross_attention=False)
+        use_cross_attention=False)
     seq_len = np.random.randint(10, 32)
     batch_size = 10
     if use_relative_bias:

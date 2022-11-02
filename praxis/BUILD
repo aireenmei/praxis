@@ -16,7 +16,7 @@
 # Description:
 #   Praxis: a set of modules for training machine learning models in Jax.
 
-load("//praxis:praxis.bzl", "pytype_strict_library")
+load("//praxis:praxis.bzl", "pytype_strict_contrib_test", "pytype_strict_library")
 load("//praxis:praxis.bzl", "py_strict_test")
 load("//praxis:build-visibility.bzl", "JAX_VISIBILITY")
 
@@ -29,6 +29,9 @@ exports_files(["LICENSE"])
 pytype_strict_library(
     name = "asserts",
     srcs = ["asserts.py"],
+    deps = [
+        # Implicit jax dependency.
+    ],
 )
 
 pytype_strict_library(
@@ -36,10 +39,12 @@ pytype_strict_library(
     srcs = ["base_hyperparams.py"],
     srcs_version = "PY3",
     deps = [
+        ":pax_fiddle",
         ":py_utils",
         # Implicit python proto dependency.
         # Implicit absl.logging dependency.
         # Implicit fiddle dependency.
+        # Implicit ml_collections config_dict dependency.
         # Implicit numpy dependency.
         # Implicit tensorflow_no_contrib dependency.
     ],
@@ -69,14 +74,16 @@ pytype_strict_library(
     deps = [
         ":asserts",
         ":base_hyperparams",
+        ":pax_fiddle",
         ":py_utils",
         ":pytypes",
         # Implicit absl.flags dependency.
         # Implicit absl.logging dependency.
+        # Implicit fiddle dependency.
+        # Implicit fiddle.daglish dependency.
         # Implicit flax.core dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -89,7 +96,6 @@ pytype_strict_library(
         ":base_layer",
         ":py_utils",
         ":pytypes",
-        "//third_party/py/clu:metrics",
     ],
 )
 
@@ -175,10 +181,9 @@ pytype_strict_library(
         ":optimizer_prefix_vectorization",
         ":optimizers",
         ":py_utils",
-        ":pytypes",
+        ":sgf",
         # Implicit jax dependency.
         # Implicit optax dependency.
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -250,7 +255,7 @@ pytype_strict_library(
     srcs_version = "PY3",
     deps = [
         ":py_utils",
-        "//third_party/py/clu:metrics",
+        # Implicit clu.metrics dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
     ],
@@ -285,6 +290,20 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "sgf",
+    srcs = ["sgf.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":base_hyperparams",
+        ":py_utils",
+        ":pytypes",
+        # Implicit flax.core dependency.
+        # Implicit jax dependency.
+        # Implicit optax dependency.
+    ],
+)
+
+pytype_strict_library(
     name = "test_utils",
     testonly = True,
     srcs = ["test_utils.py"],
@@ -307,8 +326,31 @@ pytype_strict_library(
     deps = [
         ":base_layer",
         # Implicit flax.core dependency.
+        # Implicit jax dependency.
         # Implicit optax dependency.
-        # Implicit tensorflow_no_contrib dependency.
+    ],
+)
+
+pytype_strict_library(
+    name = "pax_fiddle",
+    srcs = ["pax_fiddle.py"],
+    deps = [
+        # Implicit fiddle dependency.
+        # Implicit fiddle.building dependency.
+        # Implicit fiddle.daglish dependency.
+        # Implicit fiddle.history dependency.
+        # Implicit fiddle.experimental.auto_config dependency.
+        # Implicit fiddle.experimental.dataclasses dependency.
+        # Implicit fiddle.extensions.jax dependency.
+        # Implicit flax.core dependency.
+    ],
+)
+
+pytype_strict_library(
+    name = "fiddle_tags",
+    srcs = ["fiddle_tags.py"],
+    deps = [
+        # Implicit fiddle dependency.
     ],
 )
 
@@ -317,6 +359,7 @@ py_strict_test(
     srcs = ["asserts_test.py"],
     deps = [
         ":asserts",
+        ":py_utils",
         # Implicit absl.testing.absltest dependency.
         # Implicit absl.testing.parameterized dependency.
     ],
@@ -331,8 +374,10 @@ py_strict_test(
     deps = [
         ":base_hyperparams",
         ":base_layer",
+        ":pax_fiddle",
         # Implicit absl.testing.absltest dependency.
         # Implicit fiddle dependency.
+        # Implicit ml_collections config_dict dependency.
     ],
 )
 
@@ -356,14 +401,17 @@ py_strict_test(
     ],
 )
 
-py_strict_test(
+pytype_strict_contrib_test(
     name = "base_layer_test",
     srcs = ["base_layer_test.py"],
     deps = [
         ":base_layer",
-        ":py_utils",
+        ":pax_fiddle",
         ":test_utils",
         # Implicit absl.testing.absltest dependency.
+        # Implicit absl.testing.parameterized dependency.
+        # Implicit fiddle dependency.
+        # Implicit flax.core dependency.
         # Implicit jax dependency.
     ],
 )
@@ -421,6 +469,7 @@ py_strict_test(
     name = "learners_test",
     srcs = ["learners_test.py"],
     deps = [
+        ":asserts",
         ":base_hyperparams",
         ":base_layer",
         ":learners",
@@ -435,7 +484,6 @@ py_strict_test(
         # Implicit jax dependency.
         # Implicit numpy dependency.
         # Implicit optax dependency.
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -469,7 +517,6 @@ py_strict_test(
         # Implicit flax.core dependency.
         # Implicit jax dependency.
         # Implicit numpy dependency.
-        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -508,5 +555,21 @@ py_strict_test(
         # Implicit jax dependency.
         # Implicit lingvo.core.py_utils dependency.
         # Implicit lingvo.core.schedule dependency.
+    ],
+)
+
+py_strict_test(
+    name = "pax_fiddle_test",
+    srcs = ["pax_fiddle_test.py"],
+    deps = [
+        ":base_hyperparams",
+        ":base_layer",
+        ":pax_fiddle",
+        # Implicit absl.testing.absltest dependency.
+        # Implicit absl.testing.parameterized dependency.
+        # Implicit fiddle dependency.
+        # Implicit fiddle.testing dependency.
+        # Implicit flax.core dependency.
+        # Implicit jax dependency.
     ],
 )

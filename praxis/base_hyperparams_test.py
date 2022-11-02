@@ -20,12 +20,14 @@ import functools
 import inspect
 import pickle
 import textwrap
-from typing import Optional
+from typing import Optional, List, Tuple, Any
 
 from absl.testing import absltest
 import fiddle as fdl
+# Internal config_dict import from ml_collections
 from praxis import base_hyperparams
 from praxis import base_layer
+from praxis import pax_fiddle
 
 
 class SimpleTestClass(base_hyperparams.BaseParameterizable):
@@ -56,6 +58,38 @@ class NestedTestClass(base_hyperparams.BaseParameterizable):
     # Params.
     d: Optional[SimpleTestChild] = None
     e: float = 3.0
+
+
+class NestedTestBehaveClass(NestedTestClass):
+  # It has the same parameters with NestedTestClass,
+  # but it can have different behavior.
+  pass
+
+
+class NestedNestedTestClass(base_hyperparams.BaseParameterizable):
+  class HParams(base_hyperparams.BaseHyperParams):
+    tpl: NestedTestClass.HParams
+
+
+class NestedNestedOverrideTestClass(NestedNestedTestClass):
+  class HParams(NestedNestedTestClass.HParams):
+    _attribute_overrides: Tuple[str, ...] = ('tpl',)
+    tpl: base_hyperparams.HParams = base_hyperparams.sub_config_field(
+        NestedTestBehaveClass.HParams)
+
+
+class FiddleTestClass(base_hyperparams.BaseParameterizable):
+
+  class HParams(base_hyperparams.BaseHyperParams):
+    f: fdl.Config = None
+    g: fdl.Config = None
+    h: float = 3.0
+
+  params: base_hyperparams.BaseHyperParams
+
+
+def sample_fn(x, y=5):
+  return (x, y)
 
 
 class HyperParamsTest(absltest.TestCase):
@@ -124,6 +158,25 @@ class HyperParamsTest(absltest.TestCase):
         e : 37
         """))
 
+  def test_fdl_config_to_text(self):
+    x = FiddleTestClass.HParams(
+        f=pax_fiddle.Config(sample_fn, x=10),
+        g=pax_fiddle.Config(SimpleTestClass, SimpleTestClass.HParams(a=12)))
+    self.assertEqual(
+        x.to_text(),
+        textwrap.dedent("""\
+        cls : type/__main__/FiddleTestClass
+        f.cls : callable/__main__/sample_fn
+        f.x : 10
+        f.y : 5
+        g.cls : type/__main__/SimpleTestClass
+        g.hparams.a : 12
+        g.hparams.b : 'b'
+        g.hparams.cls : type/__main__/SimpleTestClass
+        h : 3.0
+        """))
+
+  # Internal test test_config_dict_to_text
   def test_freeze_params(self):
     # pylint: disable=protected-access
     x = NestedTestClass.HParams(
@@ -143,6 +196,24 @@ class HyperParamsTest(absltest.TestCase):
     x_clone.d.a = 300
     self.assertEqual(300, x_clone.d.a)
     # pylint: enable=protected-access
+
+  def test_copy_fields(self):
+    e_new = 0.123
+    a_new = 123
+    b_new = '456'
+    p_b = NestedNestedTestClass.HParams(
+        tpl=NestedTestClass.HParams(
+            e=e_new, d=SimpleTestChild.HParams(a=a_new, b=b_new)))
+    p_bb = NestedNestedOverrideTestClass.HParams(
+        tpl=NestedTestBehaveClass.HParams(
+            e=0.0, d=SimpleTestChild.HParams(a=0, b='')))
+    p_bb.copy_fields_from(p_b)
+    self.assertEqual(p_bb.cls, NestedNestedOverrideTestClass)
+    self.assertEqual(p_bb.tpl.cls, NestedTestClass)  # cls is overwritten too.
+    self.assertEqual(p_bb.tpl.d.cls, SimpleTestChild)
+    self.assertEqual(p_bb.tpl.e, e_new)
+    self.assertEqual(p_bb.tpl.d.a, a_new)
+    self.assertEqual(p_bb.tpl.d.b, b_new)
 
   def test_fiddle_params_config(self):
     config = SimpleTestClass.HParams.config(a=1)
@@ -192,17 +263,6 @@ class HyperParamsTest(absltest.TestCase):
 
     with self.assertRaisesRegex(TypeError, 'invalid_name'):
       _ = SimpleTestClass.config(invalid_name=5)
-
-  def test_fiddle_in_plain_dataclass_errors(self):
-    cfg = SimpleTestClass.config()
-    with self.assertRaisesRegex(TypeError,
-                                r'.*Fiddle config.*inside dataclasses'):
-      NestedTestClass.HParams(d=cfg)
-
-    nested_params = NestedTestClass.HParams()
-    with self.assertRaisesRegex(TypeError,
-                                r'.*Fiddle config.*inside dataclasses'):
-      nested_params.d = cfg
 
   def test_fiddle_nested(self):
     p = NestedTestClass.config()
@@ -293,7 +353,7 @@ class HyperParamsTest(absltest.TestCase):
     class DefaultFactoryTestClass(base_hyperparams.BaseParameterizable):
 
       class HParams(base_hyperparams.BaseHyperParams):
-        a: list[str] = dataclasses.field(default_factory=lambda: [1, 2, 3])
+        a: List[str] = dataclasses.field(default_factory=lambda: [1, 2, 3])
 
     instance_1 = DefaultFactoryTestClass.make()
     instance_2 = DefaultFactoryTestClass.make()
@@ -325,6 +385,39 @@ class HyperParamsTest(absltest.TestCase):
     cfg.foo_tpl.foo_a = 1
     bar_params = fdl.build(cfg)
     self.assertEqual(bar_params.foo_tpl.foo_a, 1)
+
+  def test_hparams_special_attributes(self):
+
+    class Foo(base_hyperparams.BaseParameterizable):
+
+      class HParams(base_hyperparams.BaseHyperParams):
+        """Test."""
+        foo_a: int = 0
+
+    self.assertEqual(Foo.HParams.__doc__, 'Test.')
+    self.assertRegex(Foo.HParams.__module__,
+                     r'__main__|\.base_hyperparams_test')
+    self.assertEqual(Foo.HParams.__name__, 'HParams')
+    self.assertEqual(
+        Foo.HParams.__qualname__,
+        'HyperParamsTest.test_hparams_special_attributes.<locals>.Foo.HParams')
+
+  def test_override_sub_config_field_protocol(self):
+
+    class CustomSubConfigField(base_hyperparams.OverrideSubConfigFieldProtocol):
+
+      def __to_sub_config_field__(self):
+        return dataclasses.field(metadata={'custom': True})
+
+    class Foo(base_hyperparams.BaseParameterizable):
+
+      class HParams(base_hyperparams.BaseHyperParams):
+        a_tpl: Any = base_hyperparams.sub_config_field(CustomSubConfigField())
+
+    field, = (
+        field for field in dataclasses.fields(Foo.HParams)
+        if field.name == 'a_tpl')
+    self.assertTrue(field.metadata.get('custom'))
 
 
 if __name__ == '__main__':

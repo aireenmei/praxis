@@ -28,6 +28,7 @@ from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import attentions
 from praxis.layers import embedding_softmax
+from praxis.layers import multi_query_attention
 from praxis.layers import normalizations
 from praxis.layers import transformers
 
@@ -100,27 +101,35 @@ def _set_stacked_transformer_sharding(stacked_transformer_p, *, w_df, w_dnh,
   if issubclass(stacked_p.cls, transformers.StackedTransformerRepeated):
     stacked_p = stacked_p.block
   transformer_p = stacked_p.transformer_layer_params_tpl
-  for atten_p in (transformer_p.tr_atten_tpl, transformer_p.cross_atten_tpl):
-    if atten_p is None:
-      continue
-    atten_wp = atten_p.weight_split_dims_mapping
-    atten_wp.proj = w_dnh
-    w_n_sharding = None if w_dnh is None else w_dnh[1]
-    atten_wp.dconv = [w_n_sharding, None]
-    atten_ap = atten_p.activation_split_dims_mapping
-    atten_ap.blnh = a_blnh
-    atten_ap.bld = a_bld
-
-  ff_p = transformer_p.tr_fflayer_tpl
-  ff_wp = ff_p.weight_split_dims_mapping
-  ff_wp.ffn0 = w_df
-  if w_df is None:
-    ff_wp.ffn1 = None
+  if isinstance(transformer_p, (list, tuple)):
+    transformer_p_lst = transformer_p
   else:
-    ff_wp.ffn1 = [w_df[1], w_df[0]]
-  ff_ap = ff_p.activation_split_dims_mapping
-  ff_ap.ffn0 = a_blf
-  ff_ap.ffn1 = a_bld
+    transformer_p_lst = [transformer_p]
+  for t_p in transformer_p_lst:
+    for atten_p in (t_p.tr_atten_tpl, t_p.cross_atten_tpl):
+      if atten_p is None:
+        continue
+      atten_wp = atten_p.weight_split_dims_mapping
+      atten_wp.proj = w_dnh
+      w_n_sharding = None if w_dnh is None else w_dnh[1]
+      atten_wp.dconv = [w_n_sharding, None]
+      atten_ap = atten_p.activation_split_dims_mapping
+      atten_ap.blnh = a_blnh
+      atten_ap.bld = a_bld
+      if atten_p.cls == multi_query_attention.MultiQueryDotProductAttention:
+        atten_wp.proj_headless = [w_dnh[0], w_dnh[2]]
+        atten_ap.blh = [a_blnh[0], a_blnh[1], a_blnh[3]]
+
+    ff_p = t_p.tr_fflayer_tpl
+    ff_wp = ff_p.weight_split_dims_mapping
+    ff_wp.ffn0 = w_df
+    if w_df is None:
+      ff_wp.ffn1 = None
+    else:
+      ff_wp.ffn1 = [w_df[1], w_df[0]]
+    ff_ap = ff_p.activation_split_dims_mapping
+    ff_ap.ffn0 = a_blf
+    ff_ap.ffn1 = a_bld
 
   if stacked_p.moe_layer_tpl is not None:
     # Set Moe layer sharding hparams.
@@ -205,9 +214,11 @@ class TransformerLm(base_layer.BaseLayer):
     vocab_size: int = 0
     packed_input: bool = False
     model_type: LanguageModelType = LanguageModelType.CAUSAL
-    ngrammer_tpl: Optional[BaseHParams] = None
-    post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = None
-    separate_embedding_tpl: Optional[BaseHParams] = None
+    ngrammer_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
+    post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = (
+        base_layer.sub_config_field(None))
+    separate_embedding_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
     final_ln_tpl: BaseHParams = sub_config_field(
         normalizations.LayerNorm.HParams)
     skip_compute_loss: bool = False
@@ -250,15 +261,7 @@ class TransformerLm(base_layer.BaseLayer):
     #
     # The batch axis of the activations are always sharded over the combination
     # of (replica_axis, data_axis).
-    lm_p.ici_mesh_shape = ici_mesh_shape
-    lm_p.dcn_mesh_shape = dcn_mesh_shape
-    lm_p.mesh_axis_names = mesh_axis_names
 
-    mesh_kwargs = {
-        'ici_mesh_shape': lm_p.ici_mesh_shape,
-        'dcn_mesh_shape': lm_p.dcn_mesh_shape,
-        'mesh_axis_names': mesh_axis_names,
-    }
     if batch_axes is None:
       batch_axes = (replica_axis, data_axis)
     bld = [batch_axes, None, mdl_axis
@@ -290,7 +293,70 @@ class TransformerLm(base_layer.BaseLayer):
     a_egch = [data_axis, None, None, mdl_axis]
     # a_egcm: sharding of the output of second MoE FFN, shape (e, g, c, m).
     a_egcm = egcm
+    return cls.set_custom_sharding_params(
+        lm_p,
+        ici_mesh_shape=lm_p.ici_mesh_shape,
+        dcn_mesh_shape=lm_p.dcn_mesh_shape,
+        mesh_axis_names=mesh_axis_names,
+        w_df=w_df,
+        w_dnh=w_dnh,
+        w_emh=w_emh,
+        w_vd=w_vd,
+        a_bld=a_bld,
+        a_blf=a_blf,
+        a_blnh=a_blnh,
+        a_blv=a_blv,
+        a_egch=a_egch,
+        a_egcm=a_egcm)
 
+  @classmethod
+  def set_custom_sharding_params(
+      cls,
+      lm_p,
+      *,
+      ici_mesh_shape,
+      dcn_mesh_shape=None,
+      mesh_axis_names,
+      w_df=None,
+      w_dnh=None,
+      w_emh=None,
+      w_vd=None,
+      a_bld=None,
+      a_blf=None,
+      a_blnh=None,
+      a_blv=None,
+      a_egch=None,
+      a_egcm=None,
+  ):
+    """Configure the shardings on each tensor.
+
+    Args:
+      lm_p: A params of this class.
+      ici_mesh_shape: Shape of logical mesh for a slice.
+      dcn_mesh_shape: Shape of logical mesh between slices.
+      mesh_axis_names: A list of length len(mesh_shape). Each element of the list
+        is the name of the corresponding device axis.
+      w_df: sharding for weight of ffn0, shape (d, f). ff1 weights will be
+        inferred from it.
+      w_dnh: Sharding of qkv projection weights, shape (d, num_heads,
+        per_head_size)
+      w_emh: sharding for first MoE FFN weight, shape (e, m, h). The second MoE
+        ffn weight will be inferred from it.
+      w_vd: sharding of the embedding weight of (vocab_size, d).
+      a_bld: sharding of output of ffn/attention, shape (b, l, d).
+      a_blf: sharding of output of ffn0, shape (b, l, f).
+      a_blnh: sharding of the attention activation of shape (b, l, num_heads,
+        per_head_size).
+      a_blv: sharding of the logits activation of shape (b, l, vocab_size).
+      a_egch: sharding of the output of first MoE FFN, shape (e, g, c, h).
+      a_egcm: sharding of the output of second MoE FFN, shape (e, g, c, m).
+
+    Returns:
+      Params with sharding annotations added.
+    """
+    lm_p.ici_mesh_shape = ici_mesh_shape
+    lm_p.dcn_mesh_shape = dcn_mesh_shape
+    lm_p.mesh_axis_names = mesh_axis_names
     pos_emb_w_ld = w_df
     if (lm_p.position_emb_tpl is not None and lm_p.position_emb_tpl.cls
         == embedding_softmax.TrainablePositionalEmbedding):
@@ -300,6 +366,11 @@ class TransformerLm(base_layer.BaseLayer):
     if lm_p.ngrammer_tpl is not None:
       lm_p.ngrammer_tpl.weight_split_dims_mapping.wt = w_vd
 
+    mesh_kwargs = {
+        'ici_mesh_shape': lm_p.ici_mesh_shape,
+        'dcn_mesh_shape': lm_p.dcn_mesh_shape,
+        'mesh_axis_names': mesh_axis_names,
+    }
     lm_p.softmax_tpl = _set_embedding_softmax_sharding_params_for_transformers(
         lm_p.softmax_tpl, w_vd=w_vd, a_blv=a_blv, a_bld=a_bld, **mesh_kwargs)
 
@@ -365,12 +436,11 @@ class TransformerLm(base_layer.BaseLayer):
     assert (xformer_params.model_dims == 0 or
             xformer_params.model_dims == p.model_dims)
     xformer_params.model_dims = p.model_dims
-    if p.model_type in {
-        LanguageModelType.PREFIX, LanguageModelType.BIDIRECTIONAL
-    }:
-      xformer_params.mask_self_attention = False
-    else:
+    # TODO(pax): we shouldn't override mask_self_attention here.
+    if p.model_type == LanguageModelType.CAUSAL:
       xformer_params.mask_self_attention = True
+    else:
+      xformer_params.mask_self_attention = False
     xformer_params.packed_input = p.packed_input
     xformer_params.fold_padding_with_segment_mask = True
     if p.post_attention_ngrammer_tpls is not None:
@@ -462,62 +532,20 @@ class TransformerLm(base_layer.BaseLayer):
       xent_output.total_loss = xent_output.avg_xent + xent_output.aux_loss
     return xent_output
 
-  def __call__(self,
-               inputs: JTensor,
-               paddings: JTensor,
-               labels: Optional[NestedMap] = None,
-               segment_ids: Optional[JTensor] = None,
-               segment_pos: Optional[JTensor] = None,
-               causal_attention_mask: Optional[JTensor] = None,
-               start_time_step: int = 0) -> NestedMap:
-    """Computes xent loss given the language model inputs.
-
-    Args:
-      inputs: Input ids. An int32 JTensor of shape [B, T].
-      paddings: A 0/1 JTensor of shape [B, T] with 1 denoting padding.
-      labels: A `.NestedMap` containing the following fields: class_weights, a
-        JTensor with shape [batch, seqlen] containing weights for each target
-        word. class_ids, a JTensor with shape [B, T] of int32 dtype containing
-        the target class labels. class_probabilities, a JTensor with shape [B,
-        T, V] of float values indicating class-membership probabilities.
-      segment_ids: A JTensor of shape [B, T]. The segment that each token
-        belongs to.
-      segment_pos: A JTensor of shape [B, T]. The position of each token in a
-        segment.
-      causal_attention_mask: A JTensor of shape [B, T] where 1 indicates a token
-        position with causal attention and 0 indicates bidirectional attention.
-        This overrides part of the causal mask.
-      start_time_step: Decode extend_step start time step. When decoding after
-        prefix, start_time_step will be prefix_len - 1.
-
-    Returns:
-      Returns xent_output, where
-      `xent_output` is a `.NestedMap` as defined by `SoftmaxLayer`'s return. In
-      addition, per_sequence_xent is added which equal to the sum of xent loss
-      for tokens in a sequence.
-    """
+  def _prepare_input(self,
+                     inputs: JTensor,
+                     paddings: JTensor,
+                     segment_pos: Optional[JTensor] = None,
+                     **input_kwargs) -> JTensor:
+    del input_kwargs
     p = self.hparams
+    _, seq_length = inputs.shape
+
     # Get the input embeddings.
     if self.hparams.separate_embedding_tpl is not None:
       input_emb = self.embedding_lookup.emb_lookup(inputs)
     else:
       input_emb = self.softmax.emb_lookup(inputs)
-    batch, seq_length = inputs.shape
-
-    paddings_float32 = paddings.astype(jnp.float32)
-    num_unpadded_tokens = jnp.sum(1.0 - paddings_float32)
-    self.add_summary('num_unpadded_tokens', num_unpadded_tokens)
-    if inputs.size != 0:
-      num_tokens = jnp.array(inputs.size, jnp.float32)
-      ratio_unpadded_tokens = num_unpadded_tokens / num_tokens
-      self.add_summary('ratio_unpadded_tokens', ratio_unpadded_tokens)
-
-    if segment_ids is None:
-      assert segment_pos is None
-      # Fold the paddings with the segment mask
-      segment_ids = jnp.asarray(1 - paddings, jnp.int32)
-      segment_pos = jnp.tile(
-          jnp.arange(seq_length, dtype=jnp.int32)[None, :], [batch, 1])
 
     # Add NGrammer to the source embeddings.
     if p.ngrammer_tpl is not None:
@@ -538,13 +566,76 @@ class TransformerLm(base_layer.BaseLayer):
       inputs = input_emb + position_emb
     else:
       inputs = input_emb
+    return inputs
 
-    if p.model_type == LanguageModelType.BIDIRECTIONAL:
-      segment_mask = attentions.segment_mask(segment_ids, segment_ids,
-                                             inputs.dtype)
-    else:
-      segment_mask = attentions.causal_segment_mask(segment_ids, inputs.dtype,
-                                                    causal_attention_mask)
+  def __call__(self,
+               inputs: JTensor,
+               paddings: JTensor,
+               labels: Optional[NestedMap] = None,
+               segment_ids: Optional[JTensor] = None,
+               segment_pos: Optional[JTensor] = None,
+               causal_attention_mask: Optional[JTensor] = None,
+               segment_mask: Optional[JTensor] = None,
+               start_time_step: int = 0,
+               **input_kwargs) -> NestedMap:
+    """Computes xent loss given the language model inputs.
+
+    Args:
+      inputs: Input ids. An int32 JTensor of shape [B, T].
+      paddings: A 0/1 JTensor of shape [B, T] with 1 denoting padding.
+      labels: A `.NestedMap` containing the following fields: class_weights, a
+        JTensor with shape [batch, seqlen] containing weights for each target
+        word. class_ids, a JTensor with shape [B, T] of int32 dtype containing
+        the target class labels. class_probabilities, a JTensor with shape [B,
+        T, V] of float values indicating class-membership probabilities.
+      segment_ids: A JTensor of shape [B, T]. The segment that each token
+        belongs to.
+      segment_pos: A JTensor of shape [B, T]. The position of each token in a
+        segment.
+      causal_attention_mask: A JTensor of shape [B, T] where 1 indicates a token
+        position with causal attention and 0 indicates bidirectional attention.
+        This overrides part of the causal mask.
+      segment_mask: Optional pre-defined segment_mask passed to the transformer.
+        A JTensor of shape [B, 1, T, T]. If it is None, the segment_mask will be
+        inferred from the LanguageModelType `model_type` hparam.
+      start_time_step: Decode extend_step start time step. When decoding after
+        prefix, start_time_step will be prefix_len.
+      **input_kwargs: additional input kwargs to be sent to the transformer.
+
+    Returns:
+      Returns xent_output, where
+      `xent_output` is a `.NestedMap` as defined by `SoftmaxLayer`'s return. In
+      addition, per_sequence_xent is added which equal to the sum of xent loss
+      for tokens in a sequence.
+    """
+    p = self.hparams
+    batch, seq_length = inputs.shape
+
+    paddings_float32 = paddings.astype(jnp.float32)
+    num_unpadded_tokens = jnp.sum(1.0 - paddings_float32)
+    self.add_summary('num_unpadded_tokens', num_unpadded_tokens)
+    if inputs.size != 0:
+      num_tokens = jnp.array(inputs.size, jnp.float32)
+      ratio_unpadded_tokens = num_unpadded_tokens / num_tokens
+      self.add_summary('ratio_unpadded_tokens', ratio_unpadded_tokens)
+
+    if segment_ids is None:
+      assert segment_pos is None
+      # Fold the paddings with the segment mask
+      segment_ids = jnp.asarray(1 - paddings, jnp.int32)
+      segment_pos = jnp.tile(
+          jnp.arange(seq_length, dtype=jnp.int32)[None, :], [batch, 1])
+
+    inputs = self._prepare_input(inputs, paddings, segment_pos=segment_pos,
+                                 **input_kwargs)
+
+    if segment_mask is None:
+      if p.model_type == LanguageModelType.BIDIRECTIONAL:
+        segment_mask = attentions.segment_mask(segment_ids, segment_ids,
+                                               inputs.dtype)
+      else:
+        segment_mask = attentions.causal_segment_mask(segment_ids, inputs.dtype,
+                                                      causal_attention_mask)
 
     self.update_decode_state('time_step', start_time_step)
     output = self.transformer(
@@ -563,15 +654,25 @@ class TransformerLm(base_layer.BaseLayer):
       self,
       inputs: JTensor,
       segment_pos: Optional[JTensor] = None,
+      atten_mask: Optional[JTensor] = None,
   ) -> NestedMap:
     """Autoregressive cached decoding of Transformer LM.
+
+    In most of the cases, when `inputs` has shape [B, P], it will do
+    extend_step on N tokenks per batch. This is used to do suffix scoring after
+    autoregressive decoding.
+
+    When `inputs` has shape [B], it will do extend_step
+    on one token per batch in regular autoregressive decoding.
 
     Args:
       inputs: Target sequence of shape [B] or [B, P] corresponding to target
         sequence at index time_step. Note that the shape [B, P] corresponds to a
         prefix which is useful for decoding in some special architectures such
-        as Primer or Ngrammer.
-      segment_pos: Segment position of shape [B, 1].
+        as Primer or Ngrammer, it can also be used as suffix scoring after
+        autoregressive decoding.
+      segment_pos: Optional segment position of shape [B, T].
+      atten_mask: Optional attention mask of shape [B, 1, T, S].
 
     Returns:
       xent_output: A `.NestedMap` object containing the log probabilities and
@@ -609,11 +710,19 @@ class TransformerLm(base_layer.BaseLayer):
     else:
       inputs = input_emb
 
-    if segment_pos is not None:
-      # self.transformer expects shape [B].
-      segment_pos = jnp.squeeze(segment_pos, 1)
-    outputs = self.transformer.extend_step(
-        inputs[:, 0, :], time_step=time_step, segment_pos=segment_pos)
+    if inputs.shape[-1] > 1 and segment_pos is not None and (
+        segment_pos.shape[-1] > 1):
+      outputs = self.transformer.extend_step(
+          inputs,
+          time_step=time_step,
+          segment_pos=segment_pos,
+          atten_mask=atten_mask)
+    else:
+      if segment_pos is not None:
+        # self.transformer expects shape [B].
+        segment_pos = jnp.squeeze(segment_pos, 1)
+      outputs = self.transformer.extend_step(
+          inputs[:, 0, :], time_step=time_step, segment_pos=segment_pos)
 
     self.update_decode_state('time_step', time_step + 1)
     if p.final_ln_tpl is not None:
@@ -707,16 +816,26 @@ class TransformerEncoderDecoder(base_layer.BaseLayer):
     """
     position_emb_tpl: BaseHParams = sub_config_field(
         embedding_softmax.PositionalEmbedding.HParams)
-    encoder_position_emb_tpl: Optional[BaseHParams] = None
-    encoder_stacked_transformer_tpl: Optional[BaseHParams] = None
-    encoder_ngrammer_tpl: Optional[BaseHParams] = None
-    encoder_post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = None
-    encoder_embedding_tpl: Optional[BaseHParams] = None
-    decoder_position_emb_tpl: Optional[BaseHParams] = None
-    decoder_stacked_transformer_tpl: Optional[BaseHParams] = None
-    decoder_ngrammer_tpl: Optional[BaseHParams] = None
-    decoder_post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = None
-    decoder_embedding_tpl: Optional[BaseHParams] = None
+    encoder_position_emb_tpl: Optional[
+        BaseHParams] = base_layer.sub_config_field(None)
+    encoder_stacked_transformer_tpl: Optional[
+        BaseHParams] = base_layer.sub_config_field(None)
+    encoder_ngrammer_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
+    encoder_post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = (
+        base_layer.sub_config_field(None))
+    encoder_embedding_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
+    decoder_position_emb_tpl: Optional[
+        BaseHParams] = base_layer.sub_config_field(None)
+    decoder_stacked_transformer_tpl: Optional[
+        BaseHParams] = base_layer.sub_config_field(None)
+    decoder_ngrammer_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
+    decoder_post_attention_ngrammer_tpls: Optional[Sequence[BaseHParams]] = (
+        base_layer.sub_config_field(None))
+    decoder_embedding_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
     model_dims: int = 0
     softmax_tpl: BaseHParams = sub_config_field(
         embedding_softmax.SharedEmbeddingSoftmax.HParams)
@@ -949,8 +1068,11 @@ class TransformerEncoderDecoder(base_layer.BaseLayer):
     # No decode cache is needed in the encoder.
     if stacked_encoder_block_params.transformer_layer_params_tpl is not None:
       layer_tpl = stacked_encoder_block_params.transformer_layer_params_tpl
-      tr_atten_tpl = layer_tpl.tr_atten_tpl
-      tr_atten_tpl.decode_cache = False
+      if isinstance(layer_tpl, (list, tuple)):
+        for tpl in layer_tpl:
+          tpl.tr_atten_tpl.decode_cache = False
+      else:
+        layer_tpl.tr_atten_tpl.decode_cache = False
 
     if mask_self_attention:
       raise ValueError(

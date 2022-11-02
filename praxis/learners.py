@@ -16,6 +16,7 @@
 """Module with the Learner class."""
 
 from __future__ import annotations
+
 import dataclasses
 import re
 from typing import Optional, Sequence, Tuple, Union
@@ -29,14 +30,14 @@ from praxis import base_layer
 from praxis import optimizer_prefix_vectorization as opt_vec
 from praxis import optimizers
 from praxis import py_utils
-from praxis import pytypes
-import tensorflow.compat.v2 as tf
+from praxis import sgf
 
 JTensor = jnp.ndarray
 NestedMap = py_utils.NestedMap
 NestedJTensor = base_layer.NestedJTensor
 NestedBool = base_layer.NestedBool
-NestedHParams = pytypes.NestedHParams
+NestedWeightHParams = base_layer.NestedWeightHParams
+SummaryType = base_layer.SummaryType
 InstantiableHyperParams = base_hyperparams.InstantiableHyperParams
 instantiate = base_hyperparams.instantiate
 
@@ -77,6 +78,7 @@ class Learner(base_hyperparams.BaseParameterizable):
         loss_aggregator this param will be ignored and is expected to be None,
         otherwise it must be set. This loss_name must be in the metrics dict
         (the first return of compute_loss).
+      stochastic_gradient: Params for the stochastic gradient function.
       optimizer: Params for the optimizer.
       skip_zero_gradients: If set, skips aggregating zero gradients while
         computing gradients.This helps in case where some weights may not be
@@ -84,8 +86,14 @@ class Learner(base_hyperparams.BaseParameterizable):
         switchable layers in neural architectural search. Possible values are:
         None: do not skip zero gradients; "variable": skip if the entire
           variable gradients are almost zero.
+      grad_norm_summary: Whether or not to export accumulated grad_norm
+        summaries. Disable to save some compute.
       grad_norm_individual_vars: Whether or not to export grad_norm for each
         individual variable as summaries.
+      var_norm_summary: Whether or not to export accumulated var_norm
+        summaries. Disable to save some compute.
+      check_valid_step: Whether or not to run sanity check to ensure that the
+        training step is valid.
       vectorize_on_repeat_prefix: Whether to vectorize optimizers on the
         repeat_prefix dims of the variables. This allows stacking variables of
         different layers while not affecting the behavior of optimizers like
@@ -102,9 +110,13 @@ class Learner(base_hyperparams.BaseParameterizable):
     # create a LossAggregator on the task. Consider moving loss_name to the
     # task or having everyone set it through the loss_aggregator.
     loss_name: Optional[str] = None
+    stochastic_gradient: Optional[sgf.BaseStochasticGradient.HParams] = None
     optimizer: Optional[optimizers.BaseOptimizer.HParams] = None
     skip_zero_gradients: Optional[bool] = None
+    grad_norm_summary: bool = True
     grad_norm_individual_vars: bool = False
+    var_norm_summary: bool = True
+    check_valid_step: bool = True
     vectorize_on_repeat_prefix: bool = True
     skip_step_gradient_norm_value: float = 0.0
     enable_skip_step_on_gradient_anomalies: bool = True
@@ -122,19 +134,29 @@ class Learner(base_hyperparams.BaseParameterizable):
     p = self._hparams
     asserts.not_none(p.optimizer)
     self._optimizer = instantiate(p.optimizer)
+    self._stochastic_gradient = (None if p.stochastic_gradient is None
+                                 else instantiate(p.stochastic_gradient))
     self._get_grad_tx = self.optimizer.get_grad_transformation
 
   @property
   def optimizer(self) -> optimizers.BaseOptimizer:
-    """Return the Optimizer object of this learner."""
+    """Returns the Optimizer object of this learner."""
     return self._optimizer
+
+  @property
+  def stochastic_gradient(self) -> Optional[sgf.BaseStochasticGradient]:
+    """Returns the stochastic gradient function object of this learner."""
+    return self._stochastic_gradient
 
   def plot_learning_rate(self, step: int) -> None:
     learning_rate = self.optimizer.get_learning_rate(step)
-    base_layer.add_global_summary('learning_rate', learning_rate)
+    base_layer.add_global_summary('lr', learning_rate,
+                                  SummaryType.AGGREGATE_SCALAR)
+    base_layer.add_global_summary('learning/lr', learning_rate,
+                                  SummaryType.AGGREGATE_SCALAR)
 
   def get_grad_tx(
-      self, var_weight_hparams: NestedHParams
+      self, var_weight_hparams: NestedWeightHParams
   ) -> optimizers.GeneralGradientTransformation:
     # Apply vectorization on prefix dims.
     if not self._hparams.vectorize_on_repeat_prefix:
@@ -155,7 +177,6 @@ class Learner(base_hyperparams.BaseParameterizable):
        and should not be skipped.
     """
     p = self._hparams
-    learner_name = self._hparams.name
     # Compute gradient norm.
 
     if p.grad_norm_individual_vars:
@@ -163,13 +184,20 @@ class Learner(base_hyperparams.BaseParameterizable):
       var_keys = py_utils.extract_prefixed_keys_from_nested_map(grad_norms)
 
       def add_grad_norm_summary(key, value):
-        base_layer.add_global_summary(f'{learner_name}/grad_norm/{key}', value)
+        base_layer.add_global_summary(f'per_var_grad_norm/{key}', value,
+                                      SummaryType.AGGREGATE_SCALAR)
 
       jax.tree_map(add_grad_norm_summary, var_keys, grad_norms)
 
-    raw_grad_norm = _compute_grad_norm(raw_grads)
-    base_layer.add_global_summary(f'{learner_name}/raw_grad_norm',
-                                  raw_grad_norm)
+    if (p.grad_norm_summary or p.check_valid_step or
+        p.optimizer.clip_gradient_norm_to_value or
+        p.optimizer.clip_gradient_single_norm_to_value):
+      raw_grad_norm = _compute_grad_norm(raw_grads)
+      if p.grad_norm_summary:
+        base_layer.add_global_summary('learning/raw_grad_norm', raw_grad_norm,
+                                      SummaryType.AGGREGATE_SCALAR)
+    else:
+      raw_grad_norm = None
 
     def keep_step(grad_norm):
       keep_threshold = p.skip_step_gradient_norm_value
@@ -206,22 +234,30 @@ class Learner(base_hyperparams.BaseParameterizable):
         grad_scale = jnp.array(1.0)
       return grads, grad_scale
 
-    # Mark the step as invalid if any gradient anomaly is detected (e.g. Nan or
-    # Inf, or excessively big gradient norm).
-    valid_step = keep_step(raw_grad_norm)
-    base_layer.add_global_summary('is_valid_step',
-                                  valid_step.astype(jnp.float32))
+    if p.check_valid_step:
+      # Mark the step as invalid if any gradient anomaly is detected (e.g. Nan
+      # or Inf, or excessively big gradient norm).
+      valid_step = keep_step(raw_grad_norm)
+      base_layer.add_global_summary('learning/is_valid_step',
+                                    valid_step.astype(jnp.float32),
+                                    SummaryType.AGGREGATE_SCALAR)
+    else:
+      valid_step = True
     grads, grad_scale = clip_grads(raw_grads, raw_grad_norm)
-    base_layer.add_global_summary('grad_scale', grad_scale)
+    base_layer.add_global_summary('learning/grad_scale', grad_scale,
+                                  SummaryType.AGGREGATE_SCALAR)
 
-    clipped_grad_norm = _compute_grad_norm(grads)
-    base_layer.add_global_summary(f'{learner_name}/clipped_grad_norm',
-                                  clipped_grad_norm)
+    if p.grad_norm_summary:
+      clipped_grad_norm = _compute_grad_norm(grads)
+      base_layer.add_global_summary('learning/clipped_grad_norm',
+                                    clipped_grad_norm,
+                                    SummaryType.AGGREGATE_SCALAR)
     return grads, valid_step
 
   def update_states(
       self, grads: NestedMap, states: optax.OptState, old_vars: NestedJTensor,
-      var_weight_hparams: NestedHParams) -> Tuple[NestedMap, optax.OptState]:
+      var_weight_hparams: NestedWeightHParams
+  ) -> Tuple[NestedMap, optax.OptState]:
     """Applies gradient transformation, updates optimizer states.
 
     Args:
@@ -234,7 +270,6 @@ class Learner(base_hyperparams.BaseParameterizable):
       transformed_grad, new_states pair.
     """
     p = self._hparams
-    learner_name = p.name
 
     grads, valid_step = self.scale_gradients(grads)
     transformed_grad, new_states = self.get_grad_tx(var_weight_hparams).update(
@@ -254,16 +289,18 @@ class Learner(base_hyperparams.BaseParameterizable):
       new_states = jax.tree_map(_update, new_states, states,
                                 is_leaf=py_utils.is_optax_masked_node)
     # Final applied grad norm.
-    applied_grad_norm = _compute_grad_norm(transformed_grad)
-    base_layer.add_global_summary(f'{learner_name}/applied_grad_norm',
-                                  applied_grad_norm)
+    if p.grad_norm_summary:
+      applied_grad_norm = _compute_grad_norm(transformed_grad)
+      base_layer.add_global_summary('learning/applied_grad_norm',
+                                    applied_grad_norm,
+                                    SummaryType.AGGREGATE_SCALAR)
     return transformed_grad, new_states
 
   def apply_gradient(
       self,
       old_vars: NestedJTensor,
       transformed_grads: NestedJTensor,
-      var_weight_hparams: NestedHParams,
+      var_weight_hparams: NestedWeightHParams,
   ) -> NestedJTensor:
     """Applies grads to model_variables.
 
@@ -284,17 +321,19 @@ class Learner(base_hyperparams.BaseParameterizable):
       updated variables. Only learnable variables are updated.
     """
     p = self._hparams
-    tf.nest.assert_same_structure(old_vars, transformed_grads)
-    tf.nest.assert_same_structure(old_vars, var_weight_hparams)
+    asserts.assert_same_structure(old_vars, transformed_grads)
+    asserts.assert_same_structure(old_vars, var_weight_hparams)
 
     assert p.skip_zero_gradients is None
 
-    # Add a summary of total var norm.
-    var_squared = jax.tree_map(lambda x: jnp.sum(x * x), old_vars)
-    var_squared, _ = jax.tree_util.tree_flatten(var_squared)
-    var_squared = jnp.concatenate([x[jnp.newaxis] for x in var_squared])
-    var_norm = jnp.sqrt(jnp.sum(var_squared))
-    base_layer.add_global_summary('var_norm', var_norm)
+    if p.var_norm_summary:
+      # Add a summary of total var norm.
+      var_squared = jax.tree_map(lambda x: jnp.sum(x * x), old_vars)
+      var_squared, _ = jax.tree_util.tree_flatten(var_squared)
+      var_squared = jnp.concatenate([x[jnp.newaxis] for x in var_squared])
+      var_norm = jnp.sqrt(jnp.sum(var_squared))
+      base_layer.add_global_summary('learning/var_norm', var_norm,
+                                    SummaryType.AGGREGATE_SCALAR)
 
     # TODO(yonghui): implement skip_zero_gradients.
     # TODO(yonghui): implement numerical checks.
@@ -305,11 +344,11 @@ class Learner(base_hyperparams.BaseParameterizable):
       else:
         return old_var
 
-    var_is_learnable = tf.nest.map_structure(
+    var_is_learnable = jax.tree_util.tree_map(
         lambda x: not base_layer.var_not_trainable(x), var_weight_hparams)
 
-    return tf.nest.map_structure(_adjust_var, old_vars, transformed_grads,
-                                 var_is_learnable)
+    return jax.tree_util.tree_map(_adjust_var, old_vars, transformed_grads,
+                                  var_is_learnable)
     # TODO(yonghui): export gradient / variable summaries.
 
   @property
@@ -367,15 +406,16 @@ class MultiOptimizerLearner(Learner):
   def plot_learning_rate(self, step: int) -> None:
     p = self._hparams
     learning_rate = self.optimizer.get_learning_rate(step)
-    base_layer.add_global_summary('main/learning_rate', learning_rate)
+    base_layer.add_global_summary('learning/lr_main', learning_rate,
+                                  SummaryType.AGGREGATE_SCALAR)
 
     for name, optimizer in zip(p.auxiliary_names, self._auxiliary_optimizers):
       learning_rate = optimizer.get_learning_rate(step)
-      base_layer.add_global_summary('{0}/learning_rate'.format(name),
-                                    learning_rate)
+      base_layer.add_global_summary(f'learning/lr_{name}', learning_rate,
+                                    SummaryType.AGGREGATE_SCALAR)
 
   def get_grad_tx(
-      self, var_weight_hparams: NestedHParams
+      self, var_weight_hparams: NestedWeightHParams
   ) -> optimizers.GeneralGradientTransformation:
     """The gradient transformation the MultiOptimizer lerner.
 
@@ -439,7 +479,8 @@ class MultiOptimizerLearner(Learner):
 
   def update_states(
       self, grads: NestedMap, states: optax.OptState, old_vars: NestedJTensor,
-      var_weight_hparams: NestedHParams) -> Tuple[NestedMap, optax.OptState]:
+      var_weight_hparams: NestedWeightHParams
+  ) -> Tuple[NestedMap, optax.OptState]:
     """Applies gradient transformation, updates optimizer states.
 
     Args:

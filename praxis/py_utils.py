@@ -20,12 +20,13 @@ import dataclasses
 import functools
 import re
 import time
-from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple, TypeVar, Union
 
 from absl import flags
 from absl import logging
 import flax
 import jax
+from jax import sharding
 from jax.experimental import global_device_array as gda_lib
 from jax.experimental import maps
 from jax.experimental import mesh_utils
@@ -42,6 +43,15 @@ import optax
 flags.DEFINE_bool(
     'pmap_use_tensorstore', False,
     'Temporary flag to allow pmap users to fall back to flax checkpointing.')
+
+
+# SeqIOInput enumeration provenance keys
+PROVENANCE_PREFIX = '_seqio_provenance'
+INDEX_WITHIN_SHARD_KEY = f'{PROVENANCE_PREFIX}/index_within_shard'
+SHARD_INDEX_KEY = f'{PROVENANCE_PREFIX}/shard_index'
+NUM_SHARDS_KEY = f'{PROVENANCE_PREFIX}/num_shards'
+ENUM_PROVENANCE_KEYS = (INDEX_WITHIN_SHARD_KEY, SHARD_INDEX_KEY, NUM_SHARDS_KEY)
+_CPU = 'cpu'
 
 
 def pmap_use_tensorstore():
@@ -106,8 +116,10 @@ def unshard(array: jnp.ndarray) -> np.ndarray:
 
 def _unreplicate(x):
   """Helper to unreplicated the data based on its type."""
-  if isinstance(x, gda_lib.GlobalDeviceArray):
-    return x.local_data(0)
+  if jax.config.jax_array and isinstance(x, jax.Array):
+    return x.addressable_data(0)
+  elif isinstance(x, gda_lib.GlobalDeviceArray):
+    return x.addressable_data(0)
   elif isinstance(x, pxla.ShardedDeviceArray):
     val = x.device_buffers[0]
     # DeviceArrays returned by the `.device_buffers` property of SDA might not
@@ -270,6 +282,7 @@ def extract_prefixed_keys_from_nested_map(
 
 def sync_global_devices(name: str) -> None:
   """Sync across all hosts/devices."""
+  # Internal mock TPU handling
   global_device_count = jax.device_count()
   logging.info('Starting sync_global_devices %s across %s devices globally',
                name, global_device_count)
@@ -278,9 +291,12 @@ def sync_global_devices(name: str) -> None:
                name, global_device_count)
 
 
-def create_gda(host_arrays: np.ndarray, global_shapes: jax.ShapeDtypeStruct,
-               global_mesh: maps.Mesh,
-               pspecs: Any) -> gda_lib.GlobalDeviceArray:
+# We use Any types to allow nested data structures. They are defined in pytypes
+# which would cause a circular dependency.
+def create_gda(host_arrays: Union[np.ndarray, Any],
+               global_shapes: Union[jax.ShapeDtypeStruct,
+                                    Any], global_mesh: maps.Mesh,
+               pspecs: Any) -> Union[gda_lib.GlobalDeviceArray, Any]:
   """Create GDA from host array.
 
   Evenly partitioning x along axis 0 and device_put shards to local devices.
@@ -313,11 +329,33 @@ def create_gda(host_arrays: np.ndarray, global_shapes: jax.ShapeDtypeStruct,
 
   device_buffers = jax.tree_map(_put_to_devices, host_arrays)
 
-  def _gda(global_shape, pspec, dbs):
-    return gda_lib.GlobalDeviceArray(global_shape.shape, global_mesh, pspec,
-                                     dbs)
+  def _gda_or_jax_array(global_shape, pspec, dbs):
+    if jax.config.jax_array:
+      # This is cached because creating new sharding objects everytime is
+      # expensive in pjit dispatch path for inputs.
+      s = cached_mesh_pspec_sharding(global_mesh, pspec)
+      return jax.make_array_from_single_device_arrays(
+          global_shape.shape, s, dbs)
+    else:
+      return gda_lib.GlobalDeviceArray(global_shape.shape, global_mesh, pspec,
+                                       dbs)
 
-  return jax.tree_map(_gda, global_shapes, pspecs, device_buffers)
+  return jax.tree_map(_gda_or_jax_array, global_shapes, pspecs, device_buffers)
+
+
+@functools.lru_cache()
+def cached_mesh_pspec_sharding(mesh, pspec):
+  return sharding.MeshPspecSharding(mesh, pspec)
+
+
+# TODO(b/248152817): Delete this function when jax.Array is enabled globally.
+def copy_gda(x):
+  """Copies a GDA."""
+  if jax.config.jax_array and isinstance(x, jax.Array):
+    return jnp.copy(x)
+  assert isinstance(x, gda_lib.GlobalDeviceArray)
+  buffers = [jnp.copy(s.data) for s in x.addressable_shards]
+  return gda_lib.GlobalDeviceArray(x.shape, x.mesh, x.mesh_axes, buffers)
 
 
 def convert_fully_replicated_sda_to_gda(sda):
@@ -335,21 +373,48 @@ def convert_fully_replicated_sda_to_gda(sda):
 
 def convert_fully_replicated_gda_to_sda(gda):
   """Convert a fully replicated GDA to SDA."""
-  local_shape = (jax.local_device_count(),) + gda.shape
-  local_aval = jax.core.ShapedArray(local_shape, gda.dtype)
-  global_mesh = gda.mesh
-  sharding_spec = pxla.mesh_sharding_specs(global_mesh.local_mesh.shape,
-                                           global_mesh.local_mesh.axis_names)(
-                                               local_aval, {})
-  return pxla.make_sharded_device_array(local_aval, sharding_spec,
-                                        list(gda._device_buffers))  # pylint: disable=protected-access
+  with jax.transfer_guard('disallow'):
+    local_shape = (jax.local_device_count(),) + gda.shape
+    local_aval = jax.core.ShapedArray(local_shape, gda.dtype)
+    sharded_aval = jax.core.ShapedArray(local_shape[1:], gda.dtype)
+    sharding_spec = pxla._pmap_sharding_spec(  # pylint: disable=protected-access
+        local_shape[0], local_shape[0], 1, None, sharded_aval, 0)
+    indices = pxla.spec_to_indices(local_shape, sharding_spec)
+    return pxla.make_sharded_device_array(local_aval, sharding_spec,
+                                          list(gda._device_buffers), indices)  # pylint: disable=protected-access
+
+
+def gda_or_jax_array():
+  return jax.config.jax_array or jax.config.jax_parallel_functions_output_gda
+
+
+def convert_host_local_array_to_global_array(arr):
+  """Converts a host local array from pmap to global jax.Array.
+
+  Similar to `convert_fully_replicated_sda_to_gda` function.
+
+  Args:
+    arr: Input host local array produced by pmap.
+
+  Returns:
+    A global array similar to GDA.
+  """
+  # input `arr` is fully replicated, so it's shape is the global shape.
+  global_shape = arr.device_buffers[0].shape
+  # Create a 1D mesh to create fully replicated global jax.Array.
+  mesh = maps.Mesh(np.array(jax.devices()), axis_names=('x',))
+  partition_spec = pjit.PartitionSpec(None)
+  # pmap-produced Array has a "scrambled" device order.
+  dbs = sorted(arr.device_buffers, key=lambda x: x.device().id)
+  return jax.make_array_from_single_device_arrays(
+      global_shape, cached_mesh_pspec_sharding(mesh, partition_spec), dbs)
 
 
 def get_global_input_shape_dtype(x: jnp.ndarray) -> jax.ShapeDtypeStruct:
   """Get global input shape/dtype assuming fully sharded batch dim."""
   assert len(x.shape) >= 1
   # Assume fully sharded batch dim.
-  x_shape = (x.shape[0] * jax.process_count(),) + x.shape[1:]
+  x_shape = (x.shape[0] * jax.process_count(),) + tuple(x.shape[1:])
   return jax.ShapeDtypeStruct(x_shape, x.dtype)
 
 
@@ -404,18 +469,32 @@ def is_optax_masked_node(x: Any) -> bool:
   return isinstance(x, optax.MaskedNode)
 
 
-def maybe_pad_uneven_sharding(x: JTensor, partition_spec: pjit.PartitionSpec,
-                              shape: Sequence[int], mesh_shape: Sequence[int],
+def maybe_pad_uneven_sharding(xs: JTensor,
+                              partition_specs: Union[pjit.PartitionSpec,
+                                                     flax.struct.PyTreeNode],
+                              unpadded_shapes: Sequence[int],
+                              mesh_shape: Sequence[int],
                               mesh_axis_names: Sequence[str]) -> JTensor:
   """Pads x to make it evenly shardable, if needed."""
-  paddings = get_uneven_sharding_paddings(partition_spec, shape, mesh_shape,
-                                          mesh_axis_names)
-  if all([p == 0 for p in paddings]):
-    return x
-  # Annotate before pad to make sure they have the same sharding. (Pad does not
-  # have the highest sharding propgation priority.)
-  x = with_sharding_constraint(x, partition_spec)
-  return jnp.pad(x, [[0, p] for p in paddings])
+
+  def _maybe_pad(x, pspec, shape):
+    if is_optax_masked_node(x):
+      return x
+    paddings = get_uneven_sharding_paddings(pspec, shape, mesh_shape,
+                                            mesh_axis_names)
+    if all([p == 0 for p in paddings]):
+      return x
+    # Annotate before pad to make sure they have the same sharding. (Pad does not
+    # have the highest sharding propgation priority.)
+    x = with_sharding_constraint(x, pspec)
+    return jnp.pad(x, [[0, p] for p in paddings])
+
+  return jax.tree_map(
+      _maybe_pad,
+      xs,
+      partition_specs,
+      unpadded_shapes,
+      is_leaf=is_optax_masked_node)
 
 
 def maybe_slice_uneven_sharding(x: JTensor, partition_spec: pjit.PartitionSpec,
@@ -538,12 +617,18 @@ def create_device_mesh(ici_mesh_shape: Sequence[int],
     An ndarray of JAX devices.
   """
   if dcn_mesh_shape is not None and any(s > 1 for s in dcn_mesh_shape):
-    try:
-      device_mesh = mesh_utils.create_hybrid_device_mesh(
-          ici_mesh_shape, dcn_mesh_shape)
-    except AssertionError as e:
-      raise ValueError('Setting a nontrivial dcn_mesh_shape requires multiple '
-                       'slices') from e
+    devices = jax.devices()
+    device_kind = devices[-1].device_kind
+    if device_kind == _CPU:
+      target_shape = np.array(ici_mesh_shape) * np.array(dcn_mesh_shape)
+      device_mesh = np.array(devices).reshape(target_shape)
+    else:
+      try:
+        device_mesh = mesh_utils.create_hybrid_device_mesh(
+            ici_mesh_shape, dcn_mesh_shape, devices=devices)
+      except AssertionError as e:
+        raise ValueError('Setting a nontrivial dcn_mesh_shape requires '
+                         'multiple slices') from e
   else:
     device_mesh = mesh_utils.create_device_mesh(ici_mesh_shape)
   logging.info('device_mesh: %s', device_mesh)
@@ -700,3 +785,49 @@ def timeit(min_elapsed: float = 1e-6) -> Iterator[RunningPeriod]:
     yield period
   finally:
     period.end = time.time()
+
+
+def filter_by_matching_keys(batch: NestedMap,
+                            prefixes: Sequence[str] = ()) -> Tuple[
+                                NestedMap, NestedMap]:
+  """Filter a map into one that matches any prefix and one that doesn't."""
+  def _matching_fn(k: str) -> bool:
+    for prefix in prefixes:
+      if k.startswith(prefix):
+        return True
+
+    return False
+
+  matching = batch.FilterKeyVal(lambda k, _: _matching_fn(k))
+  non_matching = batch.FilterKeyVal(lambda k, _: not _matching_fn(k))
+
+  return matching, non_matching
+
+
+def get_enumeration_id(example: Dict[str, Any],
+                       pop: bool = False) -> Optional[str]:
+  """Build enumeration ID string from example map's enumeration fields.
+
+  Args:
+    example: a mapping between field names and an item, which is typically an
+      array.
+    pop: whether or not to modify the input 'example' in-place and pop
+      enumeration related fields.
+
+  Returns:
+    a string represending the enumeration ID which should be globally unique
+      within a given dataset. If enum fields DNE in example, returns None.
+  """
+  if not all(k in example for k in (
+      INDEX_WITHIN_SHARD_KEY, SHARD_INDEX_KEY, NUM_SHARDS_KEY)):
+    return
+
+  if pop:
+    get_fn = lambda ex, key: int(ex.pop(key))
+  else:
+    get_fn = lambda ex, key: int(ex[key])
+
+  return (
+      f'{INDEX_WITHIN_SHARD_KEY}={get_fn(example, INDEX_WITHIN_SHARD_KEY)}/'
+      f'{SHARD_INDEX_KEY}={get_fn(example, SHARD_INDEX_KEY)}/'
+      f'{NUM_SHARDS_KEY}={get_fn(example, NUM_SHARDS_KEY)}')

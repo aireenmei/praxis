@@ -112,7 +112,7 @@ class MockLM(base_layer.BaseLayer):
 
   def setup(self) -> None:
     p = self.hparams
-    self.logits = jnp.array(p.logits, dtype=jnp.float32)
+    self._logits = jnp.array(p.logits, dtype=jnp.float32)
 
   def __call__(self, *args: Any, **kwargs: Any) -> None:
     self.put_variable(DECODE_CACHE, 'time_step', 0)
@@ -127,7 +127,7 @@ class MockLM(base_layer.BaseLayer):
   ) -> Any:
     ret = NestedMap()
     time_step = self.get_variable(DECODE_CACHE, 'time_step')
-    ret.logits = jnp.take(self.logits, inputs, axis=0)
+    ret.logits = jnp.take(self._logits, inputs, axis=0)
     self.put_variable(DECODE_CACHE, 'time_step', time_step + 1)
     return ret
 
@@ -137,10 +137,10 @@ class BeamSearchTest(test_utils.TestCase):
   def _run_decode(self, decoder_p, logits, input_batch):
     p = models.LanguageModel.HParams(
         name='mock_lm',
-        decoder=decoder_p.clone(),
-        lm=MockLM.HParams(logits=logits))
+        decoder_tpl=decoder_p.clone(),
+        lm_tpl=MockLM.HParams(logits=logits))
     lang_model = instantiate(p)
-    theta = NestedMap(lm=NestedMap())
+    theta = NestedMap(lm_tpl=NestedMap())
     # We fix seed to 9 to get the desired prefix lengths below.
     prng_key = jax.random.PRNGKey(seed=9)
     results, _ = lang_model.apply(

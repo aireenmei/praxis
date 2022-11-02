@@ -27,6 +27,7 @@ from praxis.layers.activations import SiLU
 from praxis.layers.activations import SquaredReLU
 from praxis.layers.activations import Swish
 from praxis.layers.activations import Tanh
+from praxis.layers.adapters import AdaptedTransformerFeedForward
 from praxis.layers.adapters import MultitaskResidualAdapter
 from praxis.layers.attentions import AttentionProjection
 from praxis.layers.attentions import causal_mask
@@ -35,7 +36,6 @@ from praxis.layers.attentions import CausalDepthwiseConv1D
 from praxis.layers.attentions import convert_paddings_to_mask
 from praxis.layers.attentions import DotProductAttention
 from praxis.layers.attentions import DotProductAttentionXL
-from praxis.layers.attentions import limited_context_mask_from_padding
 from praxis.layers.attentions import LocalSelfAttention
 from praxis.layers.attentions import LocalSelfAttentionXL
 from praxis.layers.attentions import PerDimScale
@@ -45,9 +45,12 @@ from praxis.layers.augmentations import MaskedLmDataAugmenter
 from praxis.layers.bregman import BregmanPCA
 from praxis.layers.checkpoint_policy import AutodiffCheckpointType
 from praxis.layers.conformers import Conformer
+from praxis.layers.conformers import DotProductAttentionWithContext
+from praxis.layers.conformers import DotProductAttentionWithContextXL
 from praxis.layers.conformers import SelfAttentionWithNormAndResidual
 from praxis.layers.convolutions import Conv2D
 from praxis.layers.convolutions import ConvBNAct
+from praxis.layers.convolutions import ConvBNActWithPadding
 from praxis.layers.convolutions import DepthwiseConv1D
 from praxis.layers.convolutions import LightConv1D
 from praxis.layers.embedding_softmax import Embedding
@@ -80,6 +83,8 @@ from praxis.layers.normalizations import BatchNorm
 from praxis.layers.normalizations import compute_moments
 from praxis.layers.normalizations import GroupNorm
 from praxis.layers.normalizations import LayerNorm
+from praxis.layers.normalizations import RmsNorm
+from praxis.layers.normalizations import RmsNormNoScale
 from praxis.layers.pipeline import LayerwiseShardablePipelined
 from praxis.layers.poolings import GlobalPooling
 from praxis.layers.poolings import Pooling
@@ -109,3 +114,4 @@ from praxis.layers.vanillanets import VanillaBlock
 from praxis.layers.vanillanets import VanillaNet
 from praxis.layers.vits import VisionTransformer
 from praxis.layers.vits import VitEntryLayers
+from praxis.layers.vits import VitExitLayers

@@ -21,6 +21,7 @@ import jax
 from jax import numpy as jnp
 import numpy as np
 import optax
+from praxis import asserts
 from praxis import base_hyperparams
 from praxis import base_layer
 from praxis import learners
@@ -29,7 +30,6 @@ from praxis import optimizers
 from praxis import py_utils
 from praxis import schedules
 from praxis import test_utils
-import tensorflow.compat.v2 as tf
 
 NestedMap = py_utils.NestedMap
 instantiate = base_hyperparams.instantiate
@@ -451,7 +451,7 @@ class LearnersTest(test_utils.TestCase):
     # Optimizers are chained as l1 - l2 - optimizer update - weight_decay.
     for k in partition_spec_single[0][2]._fields:
       for p in partition_spec:
-        tf.nest.assert_same_structure(
+        asserts.assert_same_structure(
             getattr(p[0][2], k), getattr(partition_spec_single[0][2], k))
 
   def test_vectorized_prefix(self):
@@ -624,31 +624,32 @@ class LearnersTest(test_utils.TestCase):
                           jnp.zeros_like(variables.b) + jnp.sum(variables.b))
 
       expected_summary_keys = [
-          '//s.[2, 2]_scalar', '//s.[2]_scalar', '//s.[]_scalar',
-          '//u.[2, 2]_scalar', '//u.[2]_scalar', '//u.[]_scalar'
+          's.[2, 2]_scalar', 's.[2]_scalar', 's.[]_scalar', 'u.[2, 2]_scalar',
+          'u.[2]_scalar', 'u.[]_scalar'
       ]
       summaries = base_layer.all_global_summaries()
-      self.assertCountEqual(expected_summary_keys, sorted(summaries))
-      self.assertEqual(summaries['//s.[2, 2]_scalar'].shape, (2, 2))
-      self.assertEqual(summaries['//s.[2, 2]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//s.[2, 2]_scalar']._value.tolist(),
+      with self.subTest('test_keys'):
+        self.assertCountEqual(expected_summary_keys, sorted(summaries))
+      self.assertEqual(summaries['s.[2, 2]_scalar'].shape, (2, 2))
+      self.assertEqual(summaries['s.[2, 2]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['s.[2, 2]_scalar']._value.tolist(),
                        [[1.0, 2.0], [3.0, 4.0]])
-      self.assertEqual(summaries['//s.[2]_scalar'].shape, (2,))
-      self.assertEqual(summaries['//s.[2]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//s.[2]_scalar']._value.tolist(), [1.0, 2.0])
-      self.assertEqual(summaries['//s.[]_scalar'].shape, ())
-      self.assertEqual(summaries['//s.[]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//s.[]_scalar']._value.tolist(), 3.0)
-      self.assertEqual(summaries['//u.[2, 2]_scalar'].shape, (2, 2))
-      self.assertEqual(summaries['//u.[2, 2]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//u.[2, 2]_scalar']._value.tolist(),
+      self.assertEqual(summaries['s.[2]_scalar'].shape, (2,))
+      self.assertEqual(summaries['s.[2]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['s.[2]_scalar']._value.tolist(), [1.0, 2.0])
+      self.assertEqual(summaries['s.[]_scalar'].shape, ())
+      self.assertEqual(summaries['s.[]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['s.[]_scalar']._value.tolist(), 3.0)
+      self.assertEqual(summaries['u.[2, 2]_scalar'].shape, (2, 2))
+      self.assertEqual(summaries['u.[2, 2]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['u.[2, 2]_scalar']._value.tolist(),
                        [[0.0, 0.0], [0.0, 0.0]])
-      self.assertEqual(summaries['//u.[2]_scalar'].shape, (2,))
-      self.assertEqual(summaries['//u.[2]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//u.[2]_scalar']._value.tolist(), [0.0, 0.0])
-      self.assertEqual(summaries['//u.[]_scalar'].shape, ())
-      self.assertEqual(summaries['//u.[]_scalar'].dtype, np.float32)
-      self.assertEqual(summaries['//u.[]_scalar']._value.tolist(), 0.0)
+      self.assertEqual(summaries['u.[2]_scalar'].shape, (2,))
+      self.assertEqual(summaries['u.[2]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['u.[2]_scalar']._value.tolist(), [0.0, 0.0])
+      self.assertEqual(summaries['u.[]_scalar'].shape, ())
+      self.assertEqual(summaries['u.[]_scalar'].dtype, np.float32)
+      self.assertEqual(summaries['u.[]_scalar']._value.tolist(), 0.0)
 
 
 if __name__ == '__main__':

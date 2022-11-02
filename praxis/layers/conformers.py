@@ -15,8 +15,11 @@
 
 """Conformer-related layers."""
 
-from typing import Optional
+from typing import Optional, Tuple
+
+import jax.numpy as jnp
 from praxis import asserts
+from praxis import base_hyperparams
 from praxis import base_layer
 from praxis import py_utils
 from praxis.layers import activations
@@ -25,14 +28,132 @@ from praxis.layers import convolutions
 from praxis.layers import normalizations
 from praxis.layers import stochastics
 from praxis.layers import transformers
-
-import jax.numpy as jnp
-
 NestedMap = py_utils.NestedMap
 JTensor = base_layer.JTensor
 sub_config_field = base_layer.sub_config_field
 
 BaseHParams = base_layer.BaseLayer.HParams
+BaseHyperParams = base_hyperparams.BaseHyperParams
+
+
+class DotProductAttentionWithContext(attentions.DotProductAttention):
+  """Dot-product attention with given left and right context.
+
+  It covers several use cases:
+    1 global self attention when left_context=right_context=None
+    2 local self attention when left_context!=None and right_context!=None
+    3 hybrid self attention when left_context or right_context is None
+
+  For use cases (2,3) it will use emulated local self attention.
+  For use case (2) it is more efficient to use LocalSelfAttention.
+  """
+
+  class HParams(attentions.DotProductAttention.HParams):
+    left_context: Optional[int] = None
+    right_context: Optional[int] = None
+    """Associated hyper-params for this layer class.
+
+    Attributes:
+      left_context: Number of left positions to attend (including current
+        position). If set, use a limited attention context from the left.
+      right_context: Number of right positions to attend. If set, use a limited
+        attention context from the right. Otherwise if it is None, use all the
+        frames in the right with DotProductAttention. For causal, set it to 0.
+    """
+
+  def _dot_atten(
+      self,
+      query: JTensor,
+      key: JTensor,
+      value: JTensor,
+      atten_mask: JTensor,
+      relative_bias: Optional[JTensor] = None) -> Tuple[JTensor, JTensor]:
+    """Main attention function.
+
+    Args:
+      query: JTensor of shape [B, T, N, H].
+      key: JTensor of shape [B, S, N, H].
+      value: JTensor of shape [B, S, N, H].
+      atten_mask: JTensor of shape [1|B, 1, 1|T, S] which is a mask that is
+        applied to prevent attention between unwanted pairs. This has already
+        been converted into large negative logits. Note that the first and third
+        dimension allow size 1 if the mask is shared by every item in the batch
+        or every token in the target sequence.
+      relative_bias: Relative bias of shape [B, N, T, S].
+
+    Returns:
+      encoded: JTensor of shape [B, T, N, H].
+      atten_probs: JTensor of shape [B, N, T, S].
+    """
+    p = self.hparams
+    time_size = query.shape[1]
+
+    if p.left_context is not None or p.right_context is not None:
+      input_atten_mask = atten_mask
+      atten_mask = attentions.limited_context_mask(p.left_context,
+                                                   p.right_context, time_size)
+      atten_mask = jnp.minimum(atten_mask, input_atten_mask)
+    return super()._dot_atten(query, key, value, atten_mask, relative_bias)
+
+
+class DotProductAttentionWithContextXL(attentions.DotProductAttentionXL):
+  """Dot-product attention with given left and right context.
+
+  It covers several use cases:
+    1 global self attention when left_context=right_context=None
+    2 local self attention when left_context!=None and right_context!=None
+    3 hybrid self attention when left_context or right_context is None
+
+  For use cases (2,3) it will use emulated local self attention.
+  For use case (2) it is more efficient to use LocalSelfAttentionXL.
+  """
+
+  class HParams(attentions.DotProductAttentionXL.HParams):
+    left_context: Optional[int] = None
+    right_context: Optional[int] = None
+    """Associated hyper-params for this layer class.
+
+    Attributes:
+      left_context: Number of left positions to attend (including current
+        position). If set, use a limited attention context from the left.
+      right_context: Number of right positions to attend. If set, use a limited
+        attention context from the right. Otherwise if it is None, use all the
+        frames in the right with DotProductAttentionXL. For causal, set it to 0.
+    """
+
+  def _dot_atten(
+      self,
+      query: JTensor,
+      key: JTensor,
+      value: JTensor,
+      atten_mask: JTensor,
+      relative_bias: Optional[JTensor] = None) -> Tuple[JTensor, JTensor]:
+    """Main attention function.
+
+    Args:
+      query: JTensor of shape [B, T, N, H].
+      key: JTensor of shape [B, S, N, H].
+      value: JTensor of shape [B, S, N, H].
+      atten_mask: JTensor of shape [1|B, 1, 1|T, S] which is a mask that is
+        applied to prevent attention between unwanted pairs. This has already
+        been converted into large negative logits. Note that the first and third
+        dimension allow size 1 if the mask is shared by every item in the batch
+        or every token in the target sequence.
+      relative_bias: Relative bias of shape [B, N, T, S].
+
+    Returns:
+      encoded: JTensor of shape [B, T, N, H].
+      atten_probs: JTensor of shape [B, N, T, S].
+    """
+    p = self.hparams
+    time_size = query.shape[1]
+
+    if p.left_context is not None or p.right_context is not None:
+      input_atten_mask = atten_mask
+      atten_mask = attentions.limited_context_mask(p.left_context,
+                                                   p.right_context, time_size)
+      atten_mask = jnp.minimum(atten_mask, input_atten_mask)
+    return super()._dot_atten(query, key, value, atten_mask, relative_bias)
 
 
 class SelfAttentionWithNormAndResidual(base_layer.BaseLayer):
@@ -61,30 +182,25 @@ class SelfAttentionWithNormAndResidual(base_layer.BaseLayer):
         residual layers, such that, residual(x, y) = (x + dropout(y)).
       residual_dropout_tpl: Parameterization of residual dropout layer.
         keep_prop will be reset to (1.0 - residual_dropout_prob).
-      left_context: Number of left positions to attend (including current
-        position). If set, use a limited attention context from the left.
-        Otherwise if it is None, use all the frames in the left.
-      right_context: Number of right positions to attend. If set, use a limited
-        attention context from the right. Otherwise if it is None, use all the
-        frames in the right. For causal, set it to 0.
     """
     residual_weight: float = 1.0
     input_weight: float = 1.0
     self_atten_tpl: BaseHParams = sub_config_field(
-        attentions.DotProductAttention.HParams)
+        DotProductAttentionWithContext.HParams)
     norm_tpl: BaseHParams = sub_config_field(normalizations.LayerNorm.HParams)
     pre_layer_norm: bool = True
     residual_dropout_prob: float = 0.0
     residual_dropout_tpl: BaseHParams = sub_config_field(
         stochastics.Dropout.HParams)
-    left_context: Optional[int] = None
-    right_context: Optional[int] = None
+
+  def _create_self_atten(self):
+    """Expects to be overridden in subclasses."""
+    self.create_child('self_atten', self.hparams.self_atten_tpl)
 
   def setup(self) -> None:
     p = self.hparams
     asserts.not_none(p.self_atten_tpl)
-    self.create_child('self_atten', p.self_atten_tpl)
-
+    self._create_self_atten()
     self.create_child('norm', p.norm_tpl)
 
     # Initialize residual dropout.
@@ -103,17 +219,18 @@ class SelfAttentionWithNormAndResidual(base_layer.BaseLayer):
     if p.pre_layer_norm:
       inputs = self.norm(inputs)
 
-    if p.left_context is not None or p.right_context is not None:
-      asserts.none(atten_mask)
-      atten_mask = attentions.limited_context_mask_from_padding(
-          paddings, p.left_context, p.right_context)
+    # Convert padding to mask for attention.
+    padding_mask = attentions.convert_paddings_to_mask(paddings, inputs.dtype)
+    if p.self_atten_tpl.right_context is not None or p.self_atten_tpl.left_context is not None:
+      rev_padding_mask = jnp.transpose(padding_mask, (0, 1, 3, 2))
+      padding_mask = jnp.minimum(padding_mask, rev_padding_mask)
+
+    # Merge padding mask with atten_mask.
+    if atten_mask is None:
+      atten_mask = padding_mask
     else:
-      if atten_mask is None:
-        atten_mask = attentions.convert_paddings_to_mask(paddings, inputs.dtype)
-      else:
-        padding_mask = attentions.convert_paddings_to_mask(
-            paddings, inputs.dtype)
-        atten_mask = jnp.minimum(atten_mask, padding_mask)
+      atten_mask = jnp.minimum(atten_mask, padding_mask)
+
     result = self.self_atten(
         query_vec=inputs,
         key_vec=inputs,
@@ -209,6 +326,33 @@ class Conformer(base_layer.BaseLayer):
     final_ln_tpl: BaseHParams = sub_config_field(
         normalizations.LayerNorm.HParams)
 
+  def _dropout_prob(self, prob):
+    p = self.hparams
+    return p.dropout_prob if p.dropout_prob is not None else prob
+
+  def _create_trans_atten(self):
+    p = self.hparams
+    if 'mhsa' in p.layer_order:
+      trans_atten_p = p.trans_atten_tpl.clone().set(
+          residual_dropout_prob=self._dropout_prob(p.atten_residual_dropout),
+          self_atten_tpl=p.trans_atten_tpl.self_atten_tpl.clone().set(
+              input_dim=p.model_dims,
+              hidden_dim=p.model_dims,
+              atten_dropout_prob=self._dropout_prob(p.atten_dropout),
+              num_heads=p.atten_num_heads))
+      trans_atten_p.norm_tpl = trans_atten_p.norm_tpl.clone().set(
+          dim=p.model_dims)
+      self.create_child('trans_atten', trans_atten_p)
+
+  def _create_conv(self):
+    p = self.hparams
+    if 'conv' in p.layer_order:
+      lconv_p = p.lconv_tpl.clone().set(
+          input_dims=p.model_dims,
+          kernel_size=p.kernel_size,
+          dropout_prob=self._dropout_prob(p.conv_residual_dropout))
+      self.create_child('lconv', lconv_p)
+
   def setup(self) -> None:
     p = self.hparams
     asserts.in_set(p.layer_order,
@@ -222,9 +366,6 @@ class Conformer(base_layer.BaseLayer):
       for prob in all_dropouts:
         assert prob is None or prob == p.dropout_prob
 
-    def dropout_prob(prob):
-      return p.dropout_prob if p.dropout_prob is not None else prob
-
     if p.fflayer_start_tpl:
       if p.input_dims == p.model_dims:
         fflayer_start_p = p.fflayer_start_tpl.clone().set(
@@ -233,8 +374,8 @@ class Conformer(base_layer.BaseLayer):
             input_dims=p.input_dims,
             hidden_dims=p.model_dims * p.ffn_dim_multiplier,
             residual_weight=p.ff_residual_weight,
-            residual_dropout_prob=dropout_prob(p.ffn_residual_dropout),
-            relu_dropout_prob=dropout_prob(p.ffn_relu_dropout),
+            residual_dropout_prob=self._dropout_prob(p.ffn_residual_dropout),
+            relu_dropout_prob=self._dropout_prob(p.ffn_relu_dropout),
         )
       else:
         # Need to add another projection layer in fflayer
@@ -245,8 +386,8 @@ class Conformer(base_layer.BaseLayer):
             output_dims=p.model_dims,
             hidden_dims=p.model_dims * p.ffn_dim_multiplier,
             residual_weight=p.ff_residual_weight,
-            residual_dropout_prob=dropout_prob(p.ffn_residual_dropout),
-            relu_dropout_prob=dropout_prob(p.ffn_relu_dropout),
+            residual_dropout_prob=self._dropout_prob(p.ffn_residual_dropout),
+            relu_dropout_prob=self._dropout_prob(p.ffn_relu_dropout),
         )
       self.create_child(fflayer_start_p.name, fflayer_start_p)
 
@@ -257,32 +398,16 @@ class Conformer(base_layer.BaseLayer):
           input_dims=p.model_dims,
           hidden_dims=p.model_dims * p.ffn_dim_multiplier,
           residual_weight=p.ff_residual_weight,
-          residual_dropout_prob=dropout_prob(p.ffn_residual_dropout),
-          relu_dropout_prob=dropout_prob(p.ffn_relu_dropout),
+          residual_dropout_prob=self._dropout_prob(p.ffn_residual_dropout),
+          relu_dropout_prob=self._dropout_prob(p.ffn_relu_dropout),
       )
       if not p.fflayer_weight_sharing:
         self.create_child(fflayer_end_p.name, fflayer_end_p)
       else:
         asserts.not_none(p.fflayer_start_tpl)
 
-    if 'mhsa' in p.layer_order:
-      trans_atten_p = p.trans_atten_tpl.clone().set(
-          residual_dropout_prob=dropout_prob(p.atten_residual_dropout),
-          self_atten_tpl=p.trans_atten_tpl.self_atten_tpl.clone().set(
-              input_dim=p.model_dims,
-              hidden_dim=p.model_dims,
-              atten_dropout_prob=dropout_prob(p.atten_dropout),
-              num_heads=p.atten_num_heads))
-      trans_atten_p.norm_tpl = trans_atten_p.norm_tpl.clone().set(
-          dim=p.model_dims)
-      self.create_child('trans_atten', trans_atten_p)
-
-    if 'conv' in p.layer_order:
-      lconv_p = p.lconv_tpl.clone().set(
-          input_dims=p.model_dims,
-          kernel_size=p.kernel_size,
-          dropout_prob=dropout_prob(p.conv_residual_dropout))
-      self.create_child('lconv', lconv_p)
+    self._create_trans_atten()
+    self._create_conv()
 
     if p.final_ln_tpl:
       ln_p = p.final_ln_tpl.clone().set(name='final_ln', dim=p.model_dims)

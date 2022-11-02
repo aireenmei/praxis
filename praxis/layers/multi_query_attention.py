@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention layers."""
+"""Multi-Query Attention layers."""
 
 from typing import Dict, Optional, Tuple, Union
 
@@ -41,7 +41,7 @@ BaseActShardingHParams = base_layer.BaseLayer.ActivationShardingHParams
 class OneHeadedAttentionProjection(base_layer.BaseLayer):
   """Layer that computes projection with one head.
 
-    This layer is expected to be used within MultiQueryAttention below.
+  This layer is expected to be used within MultiQueryAttention below.
   """
 
   class HParams(BaseHParams):
@@ -152,9 +152,10 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
       dropout_tpl: Parameterization for the dropout layer.
       atten_dropout_prob: Probability at which we apply dropout to the attention
         weights.
-      proj_tpl: Parameterization for the query projection layer.
-      headless_proj_tpl: Parameterization for the key/value projection layer.
-      use_bias: Whether to use bias for projection layers.
+      proj_tpl: Parameterization for the query projection_tpl layer.
+      headless_proj_tpl: Parameterization for the key/value projection_tpl
+        layer.
+      use_bias: Whether to use bias for projection_tpl layers.
       output_proj_use_nhd_shape: Whether to use NHD variable shape in output
         projection layer.
       internal_enable_query_scale: Internal. Enable scaling of query vector.
@@ -184,11 +185,11 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     output_proj_use_nhd_shape: bool = False
     internal_enable_query_scale: bool = True
     atten_logit_cap: float = 0.0
-    relative_bias_tpl: Optional[BaseHParams] = None
+    use_rotary_position_emb: bool = False
+    relative_bias_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
     attention_extra_logit: Optional[float] = None
     dconv_qkv: bool = False
     combine_qkv: bool = False
-    use_rotary_position_emb: bool = False
 
   # SPMD partition related params.
   #
@@ -354,7 +355,7 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     return base_layer.maybe_shard(x, bd, p.mesh_axis_names)
 
   def _scale_query(self, query: JTensor) -> JTensor:
-    """When enabled, scale the query vector."""
+    """Scales the query vector if enabled."""
     p = self.hparams
     if p.internal_enable_query_scale:
       query *= (p.hidden_dim // p.num_heads)**-0.5
@@ -373,10 +374,10 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     return logits
 
   def _log_softmax_with_extra_logit(self, logits: JTensor) -> JTensor:
-    """Compute log softmax with extra logit.
+    """Computes log softmax with extra logit.
 
     self.hparams.attention_extra_logit is a user defined float value that
-    helps to stablize logit values so that they don't drift too much from it.
+    helps to stabilize logit values so that they don't drift too much from it.
 
     Args:
       logits: input logit tensor
@@ -398,7 +399,8 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
 
   def _atten_logits(self, query: JTensor, key: JTensor) -> JTensor:
     """Compute logits from query and key."""
-    logits = jnp.einsum('BTNH,BSH->BNTS', query, key)
+    query = query.transpose(0, 2, 1, 3)
+    logits = jnp.einsum('BNTH,BSH->BNTS', query, key)
     return logits
 
   def _dot_atten(
@@ -463,7 +465,8 @@ class MultiQueryDotProductAttention(base_layer.BaseLayer):
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
     # Compute the attention context.
-    encoded = jnp.einsum('BNTS,BSH->BTNH', probs, value)
+    encoded = jnp.einsum('BNTS,BSH->BNTH', probs, value)
+    encoded = encoded.transpose(0, 2, 1, 3)
     encoded = checkpoint_name(encoded, 'context')
     encoded = self._shard_blnh(encoded)
     return encoded, probs

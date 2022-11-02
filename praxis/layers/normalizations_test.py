@@ -83,7 +83,8 @@ class NormalizationsTest(test_utils.TestCase):
     paddings[1, 1] = 1.0
 
     # JaxContext needed for `do_eval`.
-    with base_layer.JaxContext.new_context():
+    context_p = base_layer.JaxContext.HParams(summary_verbosity=4)
+    with base_layer.JaxContext.new_context(hparams=context_p):
       prng_key = jax.random.PRNGKey(seed=1234)
       prng_key, init_key = jax.random.split(prng_key)
       # initial_vars[NON_TRAINABLE] has initialized moving_mean/variance.
@@ -271,6 +272,14 @@ class NormalizationsTest(test_utils.TestCase):
           tf_inputs,
           paddings=tf.convert_to_tensor(
               paddings, dtype=_JaxToTfDtype(input_dtype)))
+      # TF doesn't apply padding so we apply manually
+      paddings = np.array(paddings)
+      expanded_shape = list(paddings.shape) + [
+          1,
+      ] * (
+          len(tf_output.shape) - 2)
+      expanded_padding = np.reshape(paddings, expanded_shape)
+      tf_output *= (1 - expanded_padding)
 
     self.assertAllClose(to_np(tf_output), to_np(output))
 

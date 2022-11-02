@@ -24,11 +24,13 @@ import inspect
 import re
 import types
 import typing
-from typing import Any, Callable, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Optional, Sequence, Tuple, Type, TypeVar, Union
 
 from absl import logging
 import fiddle as fdl
+# Internal config_dict import from ml_collections
 import numpy as np
+from praxis import pax_fiddle
 from praxis import py_utils
 import tensorflow.compat.v2 as tf
 
@@ -97,8 +99,8 @@ def visit_nested_struct(obj_to_visit: Any,
                         exit_fn: Optional[Callable[[str, Any], None]] = None):
   """Recursively visits objects within a nested pytree structure.
 
-  Visit can traverse HParams, BaseHyperParams, lists, tuples, dataclasses, and
-  namedtuples.
+  Visit can traverse HParams, BaseHyperParams, lists, tuples, dataclasses,
+  namedtuples, and Fiddle Buildables.
 
   By default, visit_fn is called on any object we don't know how to
   traverse into, like an integer or a string. enter_fn and exit_fn are
@@ -111,7 +113,7 @@ def visit_nested_struct(obj_to_visit: Any,
 
   Keys are of the form::
 
-    key.subkey when traversing HParams objects
+    key.subkey when traversing HParams or Fiddle Buildable objects
     key[1] when traversing lists/tuples
     key[subkey] when traversing dataclasses or namedtuples
 
@@ -150,6 +152,7 @@ def visit_nested_struct(obj_to_visit: Any,
         exit_fn(key, val)
       else:
         visit_fn(key, val)
+    # Internal handle of type config_dict.ConfigDict in visit_nested_struct
     elif dataclasses.is_dataclass(val):
       if enter_fn(key, val):
         for f in dataclasses.fields(val):
@@ -175,6 +178,16 @@ def visit_nested_struct(obj_to_visit: Any,
       if enter_fn(key, val):
         for i, v in enumerate(val):
           _visit(f'{key}[{i}]', v)
+        exit_fn(key, val)
+      else:
+        visit_fn(key, val)
+    elif isinstance(val, fdl.Buildable):
+      cls = fdl.get_callable(val)
+      args = fdl.ordered_arguments(val, include_defaults=True)
+      if enter_fn(key, val):
+        _visit(f'{key}.cls', cls)
+        for param_name, param_val in args.items():
+          _visit(f'{key}.{param_name}', param_val)
         exit_fn(key, val)
       else:
         visit_fn(key, val)
@@ -240,6 +253,10 @@ def nested_struct_to_text(obj_to_visit: Any,
                                  type(val).__name__, proto_str)
     if isinstance(val, type):
       return 'type/' + inspect.getmodule(val).__name__ + '/' + val.__name__
+    if callable(val) and hasattr(val, '__qualname__'):
+      return f'callable/{inspect.getmodule(val).__name__}/{val.__qualname__}'
+    if isinstance(val, fdl.Buildable):
+      return repr(val)
     return type(val).__name__
 
   def _enter(key: str, val: Any) -> bool:
@@ -248,17 +265,21 @@ def nested_struct_to_text(obj_to_visit: Any,
       return True
     elif isinstance(val, BaseHyperParams):
       return True
+    # Internal handle of type config_dict.ConfigDict in nested_struct_to_text
     elif (isinstance(val, (list, tuple)) and
           all(isinstance(x, HParams) for x in val)):
       return True
     elif (isinstance(val, (list, tuple)) and
           all(isinstance(x, BaseHyperParams) for x in val)):
       return True
+    # Internal handle of config_dict.ConfigDict sequence in nested_struct_to_text
     # TODO(jiahuiyu): Create single-direction DebugString for
     # List[(str, HParams)] pattern and remove redundancies.
     elif _is_str_param_pairs(val):
       return True
     elif isinstance(val, dict):
+      return True
+    elif isinstance(val, fdl.Buildable):
       return True
     return False
 
@@ -349,7 +370,7 @@ class BaseHyperParams:
   @classmethod
   def partial(cls: Type[BaseHyperParamsSelf],
               **kwargs: Any) -> fdl.Partial[BaseHyperParamsSelf]:
-    return fdl.Partial(cls.config(**kwargs))
+    return fdl.cast(fdl.Partial, cls.config(**kwargs))
 
   @classmethod
   def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -405,12 +426,16 @@ class BaseHyperParams:
     Raises:
       TypeError: If the field is the wrong type.
     """
-    if isinstance(value, fdl.Buildable):
-      raise TypeError(
+    # TODO(edloper): Remove the special-case for pax_fiddle.Config once we've
+    # moved to the next step of Fiddle migration.
+    if (isinstance(value, fdl.Buildable) and
+        not isinstance(value, pax_fiddle.Config)):
+      logging.warning(
           'It is forbidden (almost always a mistake) to put Fiddle config '
           'objects inside dataclasses. Instead, create a fdl.Config of '
           'this Params class as well. For example, write fdl.Config(ParamsA, '
-          'a=fdl.Config(ParamsB)), not ParamsA(a=fdl.Config(ParamsB)).')
+          'a=fdl.Config(ParamsB)), not ParamsA(a=fdl.Config(ParamsB)). '
+          'However, using pax_fiddle.Config is ok for template fields.')
 
     if isinstance(value, BaseParameterizable):
       logging.warning(
@@ -435,7 +460,8 @@ class BaseHyperParams:
         field for field in dataclasses.fields(self) if field.name == name
     ]
     if not matching_fields:
-      raise AttributeError(f'Attribute {name} doesn\'t exist.')
+      qualname = self.__class__.__qualname__
+      raise AttributeError(f'Attribute {name} doesn\'t exist on {qualname}.')
 
     field, = matching_fields
     self._check_assignment(field, value)
@@ -480,8 +506,21 @@ class BaseHyperParams:
     cloned.unfreeze()
     return cloned
 
-  def copy_fields_from(self, source: 'BaseHyperParams') -> None:
-    """Copies fields from source."""
+  def copy_fields_from(
+      self,
+      source: 'BaseHyperParams',
+      missing_fields_in_self: Optional[Sequence[str]] = None) -> None:
+    """Copies fields from source.
+
+    Args:
+      source: HParams which will be copied.
+      missing_fields_in_self: List of field names of source which are allowed to
+        be missing in self.
+    """
+    if not isinstance(source, BaseHyperParams):
+      raise TypeError(
+          'Can only copy fields to BaseHyperParams from another '
+          'BaseHyperParams.  (Copying from Fiddle Config not supported yet).')
     fields = self.__dataclass_fields__  # pytype: disable=attribute-error
     for name in fields:
       # Skip the field in self but not in source.
@@ -489,6 +528,8 @@ class BaseHyperParams:
         continue
       if not hasattr(source, name):
         raise ValueError(f'Copying incompatible HParams: {name} not in source')
+
+      # cls is preserved in the destination HParams.
       if name == 'cls':
         continue
       attr_value = getattr(source, name)
@@ -499,7 +540,9 @@ class BaseHyperParams:
 
     for name in source.__dataclass_fields__:
       if not hasattr(self, name):
-        raise ValueError(f'Copying incompatible HParams: {name} not in self')
+        if (missing_fields_in_self is None or
+            name not in missing_fields_in_self):
+          raise ValueError(f'Copying incompatible HParams: {name} not in self')
 
   def set(self, **kwargs) -> 'BaseHyperParams':
     """Sets dataclasses fields from a kwargs."""
@@ -552,8 +595,31 @@ class SubConfigFactory:
     return self.get_class()()
 
 
+class OverrideSubConfigFieldProtocol:
+  """Protocol that can be used to override sub_config_field.
+
+  If `x` implements `OverrideSubConfigFieldProtocol`, then `sub_config_field(x)`
+  returns `x.__to_sub_config_field__().
+
+  This allows us to override `sub_config_field(SomeLayer.HParams)` to return
+  `pax_fiddle.template_field(SomeLayer)` when we migrate `SomeLayer` from a
+  (hparams-configured) `BaseLayer` to a (fiddle-configured) `FiddleBaseLayer`.
+  In particular, when we migrate `SomeLayer`, `SomeLayer.HParams` will become
+  a stub object that implements this protocol.
+
+  TODO(b/249483164): Remove this protocol (and the `sub_config_field` function)
+  once all layers have been updated to use `pax_fiddle.template_field` or
+  `pax_fiddle.sub_field`.
+  """
+
+  def __to_sub_config_field__(self):
+    """Returns a dataclass field."""
+    raise ValueError(f'Abstract method {type(self)}.__to_sub_config_field__')
+
+
 def sub_config_field(
-    sub_config_cls: Optional[Type[BaseHyperParams]] = None,
+    sub_config_cls: Optional[Union[Type[BaseHyperParams],
+                                   OverrideSubConfigFieldProtocol]] = None,
     *,
     lazy_ref: Optional[Callable[[], Type[BaseHyperParams]]] = None,
 ):
@@ -561,13 +627,18 @@ def sub_config_field(
 
   Args:
     sub_config_cls: A reference to a sub-configuration class, e.g.
-      `sub_config_cls=Linear.HParams`.
+      `sub_config_cls=Linear.HParams`.  If `None`, then the sub-config defaults
+      to `None`.
     lazy_ref: In the rare corner case that a class is not immediately known,
       provide `lazy_ref` as a lambda function which returns `sub_config_cls`.
   """
+  if sub_config_cls is not None and lazy_ref is not None:
+    raise TypeError('Specify sub_config_cls or lazy_ref, not both.')
   if sub_config_cls is None and lazy_ref is None:
-    raise ValueError('Please provide either sub_config_cls or lazy_ref.')
+    return pax_fiddle.template_field(None)  # Sets DO_NOT_BUILD tag.
   elif sub_config_cls is not None:
+    if hasattr(sub_config_cls, '__to_sub_config_field__'):
+      return sub_config_cls.__to_sub_config_field__()
     assert issubclass(sub_config_cls, BaseHyperParams), sub_config_cls
     lazy_ref = lambda: sub_config_cls
   return dataclasses.field(
@@ -658,7 +729,7 @@ class BaseParameterizable:
   @classmethod
   def partial(cls: Type[BaseParameterizableSelf],
               **kwargs) -> fdl.Partial[BaseParameterizableSelf]:
-    return fdl.Partial(cls.config(**kwargs))
+    return fdl.cast(fdl.Partial, cls.config(**kwargs))
 
   @classmethod
   def __init_subclass__(cls,
@@ -689,8 +760,14 @@ def _bind_cls_to_nested_params_class(cls: Type[Any]):
       ('_attribute_overrides', Tuple[str, ...], ('cls',)),
       ('cls', Type[Any], cls),
   ]
-  cls.HParams = dataclasses.make_dataclass(
-      f'{cls.__name__}.HParams', fields=fields, bases=(cls.HParams,))  # pytype: disable=wrong-arg-types
+  new_hparams = dataclasses.make_dataclass(
+      cls.HParams.__name__, fields=fields, bases=(cls.HParams,))  # pytype: disable=wrong-arg-types
+  new_hparams.__doc__ = cls.HParams.__doc__
+  # Forward cls.__module__, not cls.HParams.__module__, in case cls doesn't have
+  # its own HParams class and its parent's is defined in another module.
+  new_hparams.__module__ = cls.__module__
+  new_hparams.__qualname__ = f'{cls.__qualname__}.{new_hparams.__name__}'
+  cls.HParams = new_hparams
 
 
 def _add_precise_signature_to_make(
@@ -800,14 +877,13 @@ def instantiate(config: Union[InstantiableHyperParams, fdl.Buildable],
 
   Args:
     config: The configuration to instantiate.
-    kwargs: Additional kwargs to pass to instance constructor. Only used in
-      InstantiableHyperParams.
+    **kwargs: Additional kwargs to pass to instance constructor.
 
   Returns:
     An instance constructed from the provided configuration object `config`.
   """
   if isinstance(config, fdl.Buildable):
-    return fdl.build(config)
+    return pax_fiddle.instantiate(config, **kwargs)
   if isinstance(config, InstantiableHyperParams):
     return config.Instantiate(**kwargs)
   raise ValueError(f'Unknown configuration type: {type(config)}. (Full config: '

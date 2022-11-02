@@ -15,13 +15,16 @@
 
 """Helper function to config GLaM models."""
 
-
+from praxis import base_layer
+from praxis import pax_fiddle
 from praxis.layers import activations
 from praxis.layers import attentions
 from praxis.layers import embedding_softmax
 from praxis.layers import normalizations
 from praxis.layers import transformer_models
 from praxis.layers import transformers
+
+LanguageModelType = transformer_models.LanguageModelType
 
 
 def GlamStackedTransformerHParams(
@@ -43,6 +46,7 @@ def GlamStackedTransformerHParams(
     relative_attention_max_distance=128,
     moe_load_balance_loss_weight=0.01,
     moe_gating_func='top2',
+    moe_gating_logit_cap=0.0,
     num_groups=1,
     c_dim=None,
     capacity_factor=0.0,
@@ -69,8 +73,7 @@ def GlamStackedTransformerHParams(
     name: Name of the this layer
     moe: If this is a moe block or not.
     moe_hidden_dim: hidden dimension of MoE layer.
-    moe_gating_embedding_level: Specifies the type of MOE gating embedding
-      used.
+    moe_gating_embedding_level: Specifies the type of MOE gating embedding used.
     ffn_activation_cls: Activation function class used in the ffn layer.
     use_gated_activation: Whether to use gated activation in the ffn layer or
       not.
@@ -82,6 +85,8 @@ def GlamStackedTransformerHParams(
     relative_attention_max_distance: Max relative distance.
     moe_load_balance_loss_weight: Weight of load balancing loss in MoE layers.
     moe_gating_func: Gating function choice in the MoE Layer.
+    moe_gating_logit_cap:  Cap the absolute values of MoE gating logits by tanh.
+      Enabled when a positive value is specified.
     num_groups: Total number of groups for token dispatching in MoE layer.
     c_dim: Expert capacity.
     capacity_factor: This is the ratio between max allowed examples per expert
@@ -108,10 +113,17 @@ def GlamStackedTransformerHParams(
   p.num_experts = e_dim
   p.num_groups = num_groups
   p.mask_self_attention = mask_self_attention
-  p.cross_attention = cross_attention
+  p.use_cross_attention = cross_attention
   # Attention setup
-  p.transformer_layer_params_tpl.ln_tpl = normalizations.RmsNorm.HParams()
-  p.transformer_layer_params_tpl.ln_tpl.direct_scale = True
+  if isinstance(p.transformer_layer_params_tpl, (list, tuple)):
+    for pt in p.transformer_layer_params_tpl:
+      pt.ln_tpl = normalizations.RmsNorm.HParams()
+      pt.ln_tpl.direct_scale = True
+  else:
+    assert isinstance(p.transformer_layer_params_tpl,
+                      (base_layer.BaseLayer.HParams, pax_fiddle.Config))
+    p.transformer_layer_params_tpl.ln_tpl = normalizations.RmsNorm.HParams()
+    p.transformer_layer_params_tpl.ln_tpl.direct_scale = True
   tr_atten_tpl = p.transformer_layer_params_tpl.tr_atten_tpl  # pytype: disable=attribute-error  # enable-nested-classes
   assert tr_atten_tpl.cls == attentions.DotProductAttention
   tr_atten_tpl.attention_extra_logit = attention_extra_logit
@@ -153,6 +165,7 @@ def GlamStackedTransformerHParams(
   moe_p.ln_tpl.direct_scale = True
   moe_p.num_experts = e_dim
   moe_p.num_groups = num_groups
+  moe_p.gating_logit_cap = moe_gating_logit_cap
   moe_p.expert_capacity_dim = c_dim
   moe_p.unadjusted_expert_capacity_factor = capacity_factor
   moe_p.internal_gshard_variance_scaling_fan_in_init = True
@@ -180,6 +193,7 @@ def GlamUniTransformerLmHParams(
     relative_attention_num_buckets=32,
     relative_attention_max_distance=128,
     moe_gating_func='top2',
+    moe_gating_logit_cap=0.0,
     num_groups=1,
     c_dim=None,
     capacity_factor=0.0,
@@ -190,7 +204,9 @@ def GlamUniTransformerLmHParams(
     combine_qkv=False,
     bidirectional=False,
     num_pipeline_stages=1,
-    num_pipeline_microbatches=1) -> transformer_models.TransformerLm.HParams:
+    num_pipeline_microbatches=1,
+    model_type=LanguageModelType.CAUSAL
+) -> transformer_models.TransformerLm.HParams:
   """Common setup for GLaM Decoder-only Transformer Model.
 
   This function sets up configs for both MoE and dense GLaM models.
@@ -215,8 +231,7 @@ def GlamUniTransformerLmHParams(
     name: Name of the this layer
     moe: If this is a moe block or not.
     moe_hidden_dim: hidden dimension of MoE layer.
-    moe_gating_embedding_level: Specifies the type of MOE gating embedding
-      used.
+    moe_gating_embedding_level: Specifies the type of MOE gating embedding used.
     ffn_activation_cls: Activation function class used in the ffn layer.
     use_gated_activation: Whether to use gated activation in the ffn layer or
       not.
@@ -225,6 +240,8 @@ def GlamUniTransformerLmHParams(
     relative_attention_num_buckets: Relative attention num buckets
     relative_attention_max_distance: Max relative distance.
     moe_gating_func: Gating function choice in the MoE Layer.
+    moe_gating_logit_cap:  Cap the absolute values of MoE gating logits by tanh.
+      Enabled when a positive value is specified.
     num_groups: Total number of groups for token dispatching in MoE layer.
     c_dim: Expert capacity.
     capacity_factor: This is the ratio between max allowed examples per expert
@@ -239,6 +256,8 @@ def GlamUniTransformerLmHParams(
     bidirectional: Set to support bidirectional relative attention.
     num_pipeline_stages: Number of pipeline stages.
     num_pipeline_microbatches: Number of pipeline microbatches.
+    model_type: Type of the Language Model. Either `CAUSAL`, `PREFIX`, or
+      `BIDIRECTIONAL`.
 
   Returns:
     A Params object to set up a StackedTransformer.
@@ -249,6 +268,7 @@ def GlamUniTransformerLmHParams(
   p.model_dims = model_dim
   p.vocab_size = vocab_size
   p.position_emb_tpl = None
+  p.model_type = model_type
 
   p.final_ln_tpl = normalizations.RmsNorm.HParams(
       name='rms_norm', dim=model_dim)
@@ -279,6 +299,7 @@ def GlamUniTransformerLmHParams(
       relative_attention_max_distance=relative_attention_max_distance,
       moe_load_balance_loss_weight=moe_load_balance_loss_weight,
       moe_gating_func=moe_gating_func,
+      moe_gating_logit_cap=moe_gating_logit_cap,
       num_groups=num_groups,
       c_dim=c_dim,
       capacity_factor=capacity_factor,
@@ -293,7 +314,10 @@ def GlamUniTransformerLmHParams(
   if num_pipeline_stages == 1:
     p.stacked_transformer_tpl = (
         transformers.StackedTransformerRepeated.HParams(
-            name='decoder', block=glam_p, x_times=num_blocks))
+            name='decoder',
+            unroll_in_decode=True,
+            block=glam_p,
+            x_times=num_blocks))
   else:
     assert num_blocks % num_pipeline_stages == 0
     glam_p.num_layers = num_transformer_layers // num_pipeline_stages

@@ -15,7 +15,7 @@
 
 """Tests for Praxis attention layers."""
 
-import functools
+import itertools
 
 from absl import logging
 from absl.testing import absltest
@@ -67,7 +67,7 @@ class BlockUtilsTest(test_utils.TestCase, parameterized.TestCase):
   )
   def test_convert_to_block(self, block_size):
     x = np.random.random([2, 6, 2, 3, 4])
-    x_blocks = attentions._convert_to_block(x, block_size)
+    x_blocks = attentions.convert_to_block(x, block_size)
     # Check shape.
     batch_size = x.shape[0]
     other_dims = x.shape[2:]
@@ -88,8 +88,8 @@ class BlockUtilsTest(test_utils.TestCase, parameterized.TestCase):
   )
   def test_extract_block_context(self, block_size, left_context, right_context):
     x = np.random.random([2, 6, 2, 3, 4])
-    x_context = attentions._extract_block_context(x, block_size, left_context,
-                                                  right_context)
+    x_context = attentions.extract_block_context(x, block_size, left_context,
+                                                 right_context)
     # Check shape.
     batch_size = x.shape[0]
     other_dims = x.shape[2:]
@@ -148,6 +148,7 @@ class BlockUtilsTest(test_utils.TestCase, parameterized.TestCase):
                                                      left_context,
                                                      right_context)
     self.assertAllClose(ref_padding, padding)
+
 
 
 class AttentionsTest(test_utils.TestCase):
@@ -291,7 +292,8 @@ class AttentionsTest(test_utils.TestCase):
         is_output_projection=True)
     tf_layer = tf_layer_p.Instantiate()
 
-    tf_initial_vars = tf.nest.map_structure(lambda x: x.numpy(), tf_layer.theta)
+    tf_initial_vars = jax.tree_util.tree_map(lambda x: x.numpy(),
+                                             tf_layer.theta)
     initial_vars = py_utils.NestedMap.FromNestedDict(initial_vars['params'])
     assert_var_stats_close(initial_vars, tf_initial_vars, self)
 
@@ -491,10 +493,8 @@ class AttentionsTest(test_utils.TestCase):
         test_utils.to_np(jax_atten_prob), test_utils.to_np(tf_atten_prob))
 
   @parameterized.product(
-      rel_pos_emb_dim=[10, 16],
-      skip_term_b=[True, False],
-  )
-  def test_attention_xl(self, rel_pos_emb_dim, skip_term_b):
+      rel_pos_emb_dim=[10, 16],)
+  def test_attention_xl(self, rel_pos_emb_dim):
     mdl_dim = 16
     hidden_dim = 32
     num_heads = 4
@@ -504,7 +504,6 @@ class AttentionsTest(test_utils.TestCase):
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         rel_pos_emb_dim=rel_pos_emb_dim,
-        skip_term_b=skip_term_b,
     )
     layer = instantiate(test_layer_p)
 
@@ -544,8 +543,7 @@ class AttentionsTest(test_utils.TestCase):
         input_dim=mdl_dim,
         hidden_dim=hidden_dim,
         num_heads=num_heads,
-        rel_pos_emb_dim=rel_pos_emb_dim,
-        skip_term_b=skip_term_b)
+        rel_pos_emb_dim=rel_pos_emb_dim)
     tf_layer = tf_layer_p.Instantiate()
     tf_out, tf_atten_prob = tf_layer.FProp(
         tf_initial_vars, query_vec, key_vec, value_vec, paddings=paddings)
@@ -559,13 +557,95 @@ class AttentionsTest(test_utils.TestCase):
     self.assertAllClose(
         test_utils.to_np(jax_atten_prob), test_utils.to_np(tf_atten_prob))
 
+  def text_attention_xl_step(self):
+    mdl_dim = 16
+    hidden_dim = 32
+    num_heads = 4
+    test_layer_p = DotProductAttentionXL.HParams(
+        name='mh',
+        input_dim=mdl_dim,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        rel_pos_emb_dim=10,
+        atten_logit_cap=20.0)
+    layer = test_layer_p.Instantiate()
+    prng_key = jax.random.PRNGKey(seed=123)
+    prng_key, init_key = jax.random.split(prng_key)
+    target_batch_size = 3
+    source_max_length = 8
+    target_max_length = 8
+    query_vec = np.random.normal(
+        size=[target_batch_size, source_max_length, mdl_dim]).astype(np.float32)
+    key_vec = query_vec
+    value_vec = query_vec
+    fake_query_vec = jnp.zeros_like(query_vec)
+    atten_mask = attentions.causal_mask(query_vec)
+    segment_pos = np.tile(np.arange(source_max_length), (target_batch_size, 1))
+
+    starting_index = 0
+
+    with base_layer.JaxContext.new_context():
+      initial_vars = layer.init(
+          init_key,
+          fake_query_vec,
+          fake_query_vec,
+          fake_query_vec,
+          atten_mask,
+          query_segment_pos=segment_pos,
+          key_segment_pos=segment_pos)
+      logging.info('initial_vars: %s', initial_vars)
+      _, attention_states = layer.apply(
+          initial_vars,
+          fake_query_vec,
+          fake_query_vec,
+          fake_query_vec,
+          atten_mask,
+          query_segment_pos=segment_pos,
+          key_segment_pos=segment_pos,
+          method=layer.__call__,
+          mutable=[base_layer.DECODE_CACHE])
+      fprop_out, _ = layer.apply(
+          initial_vars,
+          query_vec,
+          key_vec,
+          value_vec,
+          atten_mask,
+          query_segment_pos=segment_pos,
+          key_segment_pos=segment_pos,
+          method=layer.__call__)
+
+      decoder_output = jnp.zeros(
+          shape=[target_max_length, target_batch_size, mdl_dim])
+
+      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
+                                                       initial_vars)
+      for t in range(starting_index, target_max_length):
+        encoded, attention_states = layer.apply(
+            updated_vars,
+            query_vec=query_vec[:, t, :],
+            atten_mask=atten_mask[:, :, t, :],
+            time_step=t,
+            segment_pos=None,
+            method=layer.extend_step,
+            mutable=[base_layer.DECODE_CACHE])
+        updated_vars = py_utils.MergeDictsWithValueCheck(
+            attention_states, initial_vars)
+        decoder_output = decoder_output.at[t].set(encoded)
+
+    decoder_output = decoder_output[starting_index:]
+    decoder_out_transposed = jnp.transpose(decoder_output, [1, 0, 2])
+    fprop_out = fprop_out[:, starting_index:]
+
+    logging.info('fprop_out: %s', fprop_out)
+    logging.info('decoder_out: %s', decoder_output)
+    self.assertAllClose(fprop_out, decoder_out_transposed)
+
   @parameterized.product(
       rel_pos_emb_dim=[10, 16],
-      skip_term_b=[True, False],
       left_context=[1, 2],
       right_context=[0, 2],
   )
-  def test_local_attention_xl(self, rel_pos_emb_dim, skip_term_b, left_context,
+  def test_local_attention_xl(self, rel_pos_emb_dim, left_context,
                               right_context):
     mdl_dim = 16
     hidden_dim = 32
@@ -577,7 +657,6 @@ class AttentionsTest(test_utils.TestCase):
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         rel_pos_emb_dim=rel_pos_emb_dim,
-        skip_term_b=skip_term_b,
         left_context=left_context,
         right_context=right_context,
         block_size=block_size,
@@ -622,7 +701,6 @@ class AttentionsTest(test_utils.TestCase):
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         rel_pos_emb_dim=rel_pos_emb_dim,
-        skip_term_b=skip_term_b,
         block_size=block_size,
         left_context=left_context,
         right_context=right_context)
@@ -735,7 +813,7 @@ class AttentionsTest(test_utils.TestCase):
     prng_key = jax.random.PRNGKey(seed=123)
     prng_key, init_key = jax.random.split(prng_key)
     initial_vars = causal_dconv_layer.init(init_key, inputs, axis)
-    if isinstance(hidden_dims, list):
+    if isinstance(hidden_dims, (list, tuple)):
       kernel_shape = hidden_dims
     else:
       kernel_shape = [hidden_dims]
@@ -964,8 +1042,8 @@ class AttentionsTest(test_utils.TestCase):
       (8, 8, 3, None),
       (9, 6, 3, 3),
   )
-  def test_limited_context_mask_from_padding(self, batch_size, max_length,
-                                             left_context, right_context):
+  def test_limited_context_mask(self, batch_size, max_length,
+                                left_context, right_context):
 
     def get_padding_from_length(length):
       idx = np.tile(np.arange(max_length), [batch_size, 1])
@@ -976,8 +1054,14 @@ class AttentionsTest(test_utils.TestCase):
     ])
     padding = jnp.asarray(get_padding_from_length(length))
 
-    result = attentions.limited_context_mask_from_padding(
-        padding, left_context, right_context)
+    mask = attentions.limited_context_mask(left_context, right_context,
+                                           padding.shape[1], np.float32)
+
+    # Merge the above mask with paddings:
+    padding_mask = attentions.convert_paddings_to_mask(padding)
+    rev_padding_mask = jnp.transpose(padding_mask, (0, 1, 3, 2))
+    result = jnp.minimum(jnp.minimum(mask, padding_mask), rev_padding_mask)
+
     expect = np.zeros((batch_size, 1, max_length, max_length))
     for b in range(batch_size):
       for t1 in range(max_length):
@@ -1232,6 +1316,91 @@ class AttentionsTest(test_utils.TestCase):
         for sample_id in range(6):
           self.assertAllClose(fprop_out[:, t, :], encoded[:, sample_id])
 
+  @parameterized.parameters(*list(itertools.product([True, False], repeat=2)))
+  def test_mha_extend_n_steps_with_lazy_broadcast_state(
+      self, combine_qkv, use_rotary_position_emb):
+    mdl_dim = 4
+    hidden_dim = 8
+    num_heads = 2
+
+    test_layer_p = attentions.DotProductAttentionWithLPB.config(
+        name='mh',
+        input_dim=mdl_dim,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        dim_per_head=4 if use_rotary_position_emb else None,
+        atten_logit_cap=20.0,
+        combine_qkv=combine_qkv,
+        dconv_qkv=False,
+        use_rotary_position_emb=use_rotary_position_emb)
+    layer = instantiate(test_layer_p)
+    target_batch_size = 3
+    source_max_length = 8
+    prefix_len = 4
+    num_samples = 2
+    query_vec = np.random.normal(
+        size=[target_batch_size, source_max_length, mdl_dim]).astype(np.float32)
+    prefix = query_vec[:, 0:prefix_len, :]
+    key_vec = query_vec
+    value_vec = query_vec
+    atten_mask = attentions.causal_mask(query_vec)
+    prefix_atten_mask = attentions.causal_mask(prefix)
+
+    with base_layer.JaxContext.new_context():
+      prng_key = jax.random.PRNGKey(seed=123)
+      prng_key, init_key = jax.random.split(prng_key)
+      initial_vars = layer.init(init_key, query_vec, key_vec, value_vec,
+                                atten_mask)
+      logging.info('initial_vars: %s', initial_vars)
+      fprop_out, attention_states = layer.apply(
+          initial_vars,
+          query_vec,
+          key_vec,
+          value_vec,
+          atten_mask,
+          method=layer.__call__)
+      # Updates decode states in fprop.
+      _, attention_states = layer.apply(
+          initial_vars,
+          prefix,
+          prefix,
+          prefix,
+          prefix_atten_mask,
+          method=layer.__call__,
+          mutable=[base_layer.DECODE_CACHE])
+      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
+                                                       initial_vars)
+
+      # First lazy broadcast.
+      _, attention_states = layer.apply(
+          updated_vars,
+          num_suffix_samples=num_samples,
+          suffix_length=source_max_length - prefix_len,
+          method=layer.lazy_broadcast_prefix,
+          mutable=[base_layer.DECODE_CACHE, base_layer.PREFIX_DECODE_CACHE])
+      updated_vars = py_utils.MergeDictsWithValueCheck(attention_states,
+                                                       initial_vars)
+
+      def _broadcast_sample(x, num_samples):
+        return jnp.repeat(x, num_samples, axis=0)
+
+      suffix_segment_pos = jnp.stack(
+          [jnp.arange(prefix_len, source_max_length)] * target_batch_size)
+
+      # Call extend step start from prefix_len.
+      encoded, _ = layer.apply(
+          updated_vars,
+          query_vec=_broadcast_sample(query_vec[:, prefix_len:, :],
+                                      num_samples),
+          atten_mask=atten_mask[:, :, prefix_len:, :],
+          time_step=prefix_len,
+          segment_pos=_broadcast_sample(suffix_segment_pos, num_samples),
+          method=layer.extend_step,
+          mutable=[base_layer.DECODE_CACHE])
+      self.assertAllClose(
+          encoded,
+          _broadcast_sample(fprop_out, num_samples)[:, prefix_len:, :])
+
   def test_right_align_decode_state(self):
     mdl_dim = 4
     hidden_dim = 8
@@ -1388,259 +1557,6 @@ class AttentionsTest(test_utils.TestCase):
     logging.info('attention_states: %s', attention_states)
     # Makes sure there is no decoder state.
     self.assertEqual(attention_states, {})
-
-
-class ChunkedAttentionsTest(test_utils.TestCase):
-
-  def setUp(self):
-    super().setUp()
-    np.random.seed(123456)
-
-  def test_smoke_test(self):
-    """Tests that fprop runs and returns the right shape."""
-    mdl_dim = 16
-    hidden_dim = 32
-    num_heads = 4
-    atten_p = attentions.DotProductAttention.HParams(
-        name='atten',
-        input_dim=mdl_dim,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        relative_bias_tpl=attentions.RelativeBias.HParams(
-            use_length_as_position=False,
-            relative_attention_num_buckets=2,
-            relative_attention_max_distance=8))
-    cca = attentions.ChunkedCrossAttention.HParams(name='cca', atten=atten_p)
-    layer = instantiate(cca)
-    batch_size = 5
-    source_length = 28
-    query_vec = np.random.normal(
-        size=[batch_size, source_length, mdl_dim]).astype(np.float32)
-    num_chunks = 7
-    num_neighbors = 3
-    retrieval_length = 6
-    neighbors = np.random.normal(
-        size=[batch_size, num_chunks, num_neighbors, retrieval_length, mdl_dim
-             ]).astype(np.float32)
-    with base_layer.JaxContext.new_context():
-      prng_key = jax.random.PRNGKey(seed=123)
-      prng_key, init_key = jax.random.split(prng_key)
-      initial_vars = layer.init(init_key, query_vec, neighbors)
-      atten_output = layer.apply(initial_vars, query_vec, neighbors)
-
-    self.assertEqual(atten_output.shape, (batch_size, source_length, mdl_dim))
-
-  def _compute_regular_atten(self, weights, q, k, v, rb_shift):
-    """Reimplementation of the regular multihead attention."""
-    # Note that for simplicity this implementation assumes
-    # p.internal_enable_query_scale = False
-    wq = weights['params']['query']['w']
-    wk = weights['params']['key']['w']
-    wv = weights['params']['value']['w']
-    bq = weights['params']['query']['b']
-    bk = weights['params']['key']['b']
-    bv = weights['params']['value']['b']
-    q_proj = jnp.einsum('BTD,DNH->BTNH', q, wq) + bq
-    k_proj = jnp.einsum('BSD,DNH->BSNH', k, wk) + bk
-    v_proj = jnp.einsum('BSD,DNH->BSNH', v, wv) + bv
-    logits = jnp.einsum('BTNH,BSNH->BNTS', q_proj, k_proj)
-    logits = logits + rb_shift
-    probs = jax.nn.softmax(logits)
-    context = jnp.einsum('BNTS,BSNH->BTNH', probs, v_proj)
-    wout = weights['params']['post']['w']
-    bout = weights['params']['post']['b']
-    out = jnp.einsum('BTNH,DNH->BTD', context, wout) + bout
-    return out
-
-  def test_attention_correct(self):
-    """Tests that the vanilla attention impl is correct."""
-    mdl_dim = 16
-    hidden_dim = 32
-    num_heads = 4
-    # disable relative bias for now to make testing easier
-    atten_p = attentions.DotProductAttention.HParams(
-        name='atten',
-        input_dim=mdl_dim,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        internal_enable_query_scale=False,
-        relative_bias_tpl=attentions.RelativeBias.HParams(
-            use_length_as_position=True,
-            relative_attention_num_buckets=8,
-            relative_attention_max_distance=16))
-
-    layer = base_layer.instantiate(atten_p)
-    batch_size = 9
-    target_length = 8  # T
-    source_length = 12  # S
-    query_vec = np.random.normal(
-        size=[batch_size, source_length, mdl_dim]).astype(np.float32)
-    key_vec = np.random.normal(
-        size=[batch_size, target_length, mdl_dim]).astype(np.float32)
-    atten_mask = np.zeros([source_length, target_length],
-                          dtype=query_vec.dtype)[None, None, :, :]
-    query_segment_pos = np.tile(
-        np.arange(source_length)[None, :], [batch_size, 1])
-    key_segment_pos = np.tile(
-        np.arange(target_length)[None, :], [batch_size, 1])
-    with base_layer.JaxContext.new_context():
-      prng_key = jax.random.PRNGKey(seed=456)
-      prng_key, init_key = jax.random.split(prng_key)
-      initial_vars = layer.init(init_key, query_vec, key_vec, key_vec,
-                                atten_mask, query_segment_pos, key_segment_pos)
-      layer = layer.bind(initial_vars)
-      atten_output, _ = layer(query_vec, key_vec, key_vec, atten_mask,
-                              query_segment_pos, key_segment_pos)
-      # shape [1, N, T, S]
-      rb_shift = layer.relative_bias(query_segment_pos, key_segment_pos)
-      # verify that vanilla attention impl is correct
-    manual_out = self._compute_regular_atten(initial_vars, query_vec, key_vec,
-                                             key_vec, rb_shift)
-    self.assertAllClose(manual_out, atten_output)
-
-  def _cross_atten(self, weights, chunk, neighbor):
-    """Computes cross attention for one chunk with one neighbor."""
-    # shapes: chunk: [M, D]. neighbor: [R, D].
-    # returns logits = [M, N, R], projected values = [R, N, H]
-    wq = weights['params']['atten']['query']['w']
-    wk = weights['params']['atten']['key']['w']
-    wv = weights['params']['atten']['value']['w']
-    bq = weights['params']['atten']['query']['b']
-    bk = weights['params']['atten']['key']['b']
-    bv = weights['params']['atten']['value']['b']
-    q_proj = jnp.einsum('MD,DNH->MNH', chunk, wq) + bq
-    k_proj = jnp.einsum('RD,DNH->RNH', neighbor, wk) + bk
-    v_proj = jnp.einsum('RD,DNH->RNH', neighbor, wv) + bv
-    logits = jnp.einsum('MNH,RNH->NMR', q_proj, k_proj)
-    return logits, v_proj
-
-  def _multi_neighbor_cross_atten(self, weights, rb_shift, chunk, neighbors):
-    """Computes cross attention for one chunk with multiple neighbors."""
-    # shapes: rb_shift: [1, N, M, R], chunk: [M, D], neighbors: [K, R, D]
-    # Returns shape [M, D].
-    # logits: [K, N, M, R], values: [K, R, N, H]
-    logits, values = jnp.vectorize(
-        functools.partial(self._cross_atten, weights),
-        signature='(m,d),(r,d)->(n,m,r),(r,n,h)')(chunk, neighbors)
-    # rb_shift has shape [1, N, M, R]
-    logits += rb_shift
-    k, n, m, r = logits.shape
-    # Shape: [N, M, T=R*K]
-    logits = jnp.moveaxis(logits, 0, -1).reshape((n, m, r * k))
-    k, r, n, h = values.shape
-    values = jnp.moveaxis(values, 0, 1).reshape((r * k, n, h))
-    probs = jax.nn.softmax(logits)
-    context = jnp.einsum('NMT,TNH->MNH', probs, values)
-    wout = weights['params']['atten']['post']['w']
-    bout = weights['params']['atten']['post']['b']
-    out = jnp.einsum('MNH,DNH->MD', context, wout) + bout
-    return out
-
-  def _compute_chunked_cross_atten(self, initial_vars, rb_shift, query,
-                                   neighbors):
-    """Manual recomputation of chunked cross attention."""
-    batch_size, t, _ = query.shape
-    num_chunks = neighbors.shape[1]
-    chunk_len = t // num_chunks
-    result = np.zeros_like(query)
-    for i in range(batch_size):
-      j = 0
-      while True:
-        if j < chunk_len - 1:
-          # Use identity for the first few positions that do not attend to any
-          # neighbors.
-          result[i, j, :] = query[i, j, :]
-          j += 1
-          continue
-        chunk_idx = (j - chunk_len + 1) // chunk_len
-        # this position should attend to chunk with index chunk_idx
-        # For example, position (chunk_len - 1) in query attends to chunk 0.
-        neigh = neighbors[i, chunk_idx, :, :, :]
-        if chunk_idx == num_chunks - 1:
-          # last chunk, we have a single time slice in the query.
-          # Pad it to chunk_length and only take the first position in the
-          # output.
-          chunk = jnp.pad(query[i, j:j + 1, :], ((0, chunk_len - 1), (0, 0)))
-          output = self._multi_neighbor_cross_atten(initial_vars, rb_shift,
-                                                    chunk, neigh)
-          result[i, j, :] = output[0, :]
-          break
-
-        chunk = query[i, j:j + chunk_len, :]
-        output = self._multi_neighbor_cross_atten(initial_vars, rb_shift, chunk,
-                                                  neigh)
-        result[i, j:j + chunk_len, :] = output
-        j += chunk_len
-    return result
-
-  @parameterized.parameters([
-      (2, 12),
-      (8, 1),
-      (16, 9),
-      (32, 4),
-  ])
-  def test_chunked_atten(self, num_chunks, num_neighbors):
-    """Tests that chunked attention results are correct."""
-    # T. So when num_chunks=32, M=chunk_length=1.
-    target_length = 32
-    mdl_dim = 16
-    hidden_dim = 32
-    num_heads = 4
-    atten_p = attentions.DotProductAttention.HParams(
-        name='atten',
-        input_dim=mdl_dim,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        internal_enable_query_scale=False,
-        relative_bias_tpl=attentions.RelativeBias.HParams(
-            use_length_as_position=False,
-            bidirectional=True,
-            relative_attention_num_buckets=8,
-            relative_attention_max_distance=16))
-    cca = attentions.ChunkedCrossAttention.HParams(name='cca', atten=atten_p)
-    layer = base_layer.instantiate(cca)
-    batch_size = 5  # B
-    # Shape [B, T, D]
-    query = np.random.normal(size=[batch_size, target_length, mdl_dim]).astype(
-        np.float32)
-    assert target_length % num_chunks == 0
-    # L: num_chunks
-    chunk_len = target_length // num_chunks  # M
-    # K: num_neighbors
-    retrieval_length = 6  # R
-    # [B, L, K, R, D]
-    neighbors = np.random.normal(
-        size=[batch_size, num_chunks, num_neighbors, retrieval_length, mdl_dim
-             ]).astype(np.float32)
-
-    with base_layer.JaxContext.new_context():
-      prng_key = jax.random.PRNGKey(seed=123)
-      prng_key, init_key = jax.random.split(prng_key)
-      initial_vars = layer.init(init_key, query, neighbors)
-      layer = layer.bind(initial_vars)
-      layer_output = layer(query, neighbors)
-
-    chunk_segment_pos = np.tile(np.arange(chunk_len)[None, :], [1, 1])
-    retrieval_segment_pos = np.tile(
-        np.arange(retrieval_length)[None, :], [1, 1])
-    with base_layer.JaxContext.new_context():
-      rb_shift = layer.atten.relative_bias(chunk_segment_pos,
-                                           retrieval_segment_pos)
-
-    result = self._compute_chunked_cross_atten(initial_vars, rb_shift, query,
-                                               neighbors)
-    self.assertAllClose(layer_output, result)
-
-    # We randomly re-arrange the K retrieved neighbors to show that the cross
-    # attention stays the same regardless of the ordering of the retrieved
-    # neighbors.
-    x = np.transpose(neighbors, [2, 0, 1, 3, 4])
-    x = np.random.permutation(x)
-    new_neighbors = np.transpose(x, [1, 2, 0, 3, 4])
-
-    with base_layer.JaxContext.new_context():
-      layer_output2 = layer(query, new_neighbors)
-    self.assertAllClose(layer_output, layer_output2)
 
 
 if __name__ == '__main__':

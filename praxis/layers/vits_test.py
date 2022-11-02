@@ -25,6 +25,7 @@ from praxis import base_layer
 from praxis import py_utils
 from praxis import test_utils
 from praxis.layers import activations
+from praxis.layers import embedding_softmax
 from praxis.layers import transformers
 from praxis.layers import vits
 
@@ -45,16 +46,28 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
         num_xformer_layers=4,
         atten_dropout_prob=0.1,
         stochastic_depth_dropout_prob=0.1,
+        prepend_cls_tokens=0,
+        append_cls_tokens=0,
+        pooled=True,
     )
 
   def _vit_entry_layers(self, exp_params):
+    num_patches = np.prod(exp_params.pos_embed_shapes)
+    num_patches += exp_params.prepend_cls_tokens
+    num_patches += exp_params.append_cls_tokens
     p_entry = vits.VitEntryLayers.HParams(
         name='entry',
         pos_embed_shapes=exp_params.pos_embed_shapes,
         patch_size=exp_params.patch_size,
-        dim_per_patch=exp_params.hidden_dim,
-        image_channels=3,
+        input_dims=exp_params.patch_size**2 * 3,
+        output_dims=exp_params.hidden_dim,
         pos_emb_dropout_prob=0.1,
+        pos_emb_tpl=embedding_softmax.TrainablePositionalEmbedding.HParams(
+            max_seq_length=num_patches,
+            embedding_dims=exp_params.hidden_dim,
+            params_init=base_layer.WeightInit.Gaussian(scale=0.02)),
+        prepend_cls_tokens=exp_params.prepend_cls_tokens,
+        append_cls_tokens=exp_params.append_cls_tokens,
     )
     return p_entry
 
@@ -64,7 +77,7 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
         hidden_dims=exp_params.hidden_dim * 4,
         num_heads=exp_params.num_heads,
         mask_self_attention=False,
-        cross_attention=False,
+        use_cross_attention=False,
         packed_input=False,
         num_layers=exp_params.num_xformer_layers,
         dropout_prob=exp_params.atten_dropout_prob,
@@ -84,6 +97,7 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
         name='exit',
         hidden_dim=exp_params.hidden_dim,
         output_dim=exp_params.hidden_dim,
+        pooled=exp_params.pooled,
         output_dropout_prob=0.1)
     return p_exit
 
@@ -98,8 +112,7 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
     p_entry = self._vit_entry_layers(exp_params)
     entry = instantiate(p_entry)
 
-    inputs_np = np.random.normal(
-        size=(exp_params.batch_size,) + input_shapes)
+    inputs_np = np.random.normal(size=(exp_params.batch_size,) + input_shapes)
     inputs = jnp.asarray(inputs_np)
 
     with base_layer.JaxContext.new_context():
@@ -115,12 +128,14 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
       seq_len = row_patch_count * col_patch_count
     elif len(input_shapes) == 2:
       seq_len = input_shapes[0]
-
     self.assertEqual(features.shape,
                      (exp_params.batch_size, seq_len, exp_params.hidden_dim))
 
-  def test_vit_exit_layers(self):
+  @parameterized.named_parameters(('pooled_exit_layer', True),
+                                  ('no_pooled_exit_layer', False))
+  def test_vit_exit_layers(self, pooled):
     exp_params = self._exp_params()
+    exp_params.pooled = pooled
     p_exit = self._vit_exit_layers(exp_params)
     exit_module = instantiate(p_exit)
 
@@ -137,9 +152,13 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
           RANDOM: subkey
       }, inputs)
       features = exit_module.apply(initial_vars, inputs, rngs={RANDOM: subkey})
-
-    self.assertEqual(features.shape,
-                     (exp_params.batch_size, exp_params.hidden_dim))
+    if pooled:
+      self.assertEqual(features.shape,
+                       (exp_params.batch_size, exp_params.hidden_dim))
+    else:
+      self.assertEqual(
+          features.shape,
+          (exp_params.batch_size, exp_params.num_tokens, exp_params.hidden_dim))
 
   def test_interpolate_embedding_2d(self):
     source_shapes = (3, 5)
@@ -168,14 +187,22 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
 
     self.assertAllClose(resized_emb, test_utils.to_np(resized_emb_expected))
 
-  @parameterized.product(pooled=[False, True], image_sizes=[(16, 16), (20, 24)])
-  def test_vit(self, pooled: bool, image_sizes: Tuple[int, int]):
+  @parameterized.product(
+      pooled=[False, True],
+      image_sizes=[(16, 16), (20, 24)],
+      prepend_cls_tokens=[0, 1, 2],
+      append_cls_tokens=[0, 1, 2])
+  def test_vit(self, pooled: bool, image_sizes: Tuple[int, int],
+               prepend_cls_tokens: int, append_cls_tokens: int):
     exp_params = self._exp_params()
     exp_params.pos_embed_shapes = (3, 5)
+    exp_params.prepend_cls_tokens = prepend_cls_tokens
+    exp_params.append_cls_tokens = append_cls_tokens
+    exp_params.pooled = pooled
 
     entry_p = self._vit_entry_layers(exp_params)
     transformer_p = self._vit_transformer_layers(exp_params)
-    exit_p = self._vit_exit_layers(exp_params).set(pooled=pooled)
+    exit_p = self._vit_exit_layers(exp_params)
 
     p_vit = vits.VisionTransformer.HParams().set(
         name='vit',
@@ -201,9 +228,22 @@ class VitTest(test_utils.TestCase, parameterized.TestCase):
                        (exp_params.batch_size, exp_params.hidden_dim))
     else:
       num_patches = np.prod(image_sizes) / (exp_params.patch_size**2)
+      num_patches += prepend_cls_tokens
+      num_patches += append_cls_tokens
       self.assertEqual(
           features.shape,
           (exp_params.batch_size, num_patches, exp_params.hidden_dim))
+
+  def test_patch_image_conversion(self):
+    batch, height, width, patch_size, channels = 8, 12, 16, 4, 3
+    expected_image = np.random.normal(size=[batch, height, width, channels])
+    image = jnp.asarray(expected_image)
+
+    with base_layer.JaxContext.new_context():
+      patches = vits.image_to_patch(image, patch_size)
+      actual_image = vits.patch_to_image(patches, image.shape, patch_size)
+
+    self.assertAllClose(expected_image, test_utils.to_np(actual_image))
 
 
 if __name__ == '__main__':

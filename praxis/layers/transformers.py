@@ -83,9 +83,9 @@ def compute_attention_masks_for_fprop(
 
   Returns:
     attention_mask: Attention mask JTensor ready to add to logits for self
-      attention of shape [B/1, 1, T/1, T].
+      attention of shape [1|B, 1, 1|T, T].
     cross_attention_mask: Attention mask ready to add to logits for cross
-      attention of shape [B/1, 1, T/1, S]. This will be None if cross_inputs
+      attention of shape [1|B, 1, 1|T, S]. This will be None if cross_inputs
       are None.
   """
   if fold_padding_with_segment_mask:
@@ -144,9 +144,9 @@ def compute_attention_masks_for_extend_step(
 
   Returns:
     attention_mask: Attention mask JTensor ready to add to logits for self
-      attention of shape [B/1, 1, 1, T].
+      attention of shape [1|B, 1, 1, T].
     cross_attention_mask: Attention mask JTensor ready to add to logits for
-      cross attention of shape [B/1, 1, 1, S]. This will be None if
+      cross attention of shape [1|B, 1, 1, S]. This will be None if
       cross_paddings are None.
   """
   # Create a broadcast friendly version of time step of shape [1, 1]
@@ -158,7 +158,7 @@ def compute_attention_masks_for_extend_step(
   causal_padding = jnp.greater(
       jnp.expand_dims(jnp.arange(seq_len), 0), batch_time_step)
 
-  # Create attention mask from padding of shape [1/B, 1, T]
+  # Create attention mask from padding of shape [1|B, 1, T]
   attention_mask = jnp.squeeze(
       attentions.convert_paddings_to_mask(causal_padding), axis=1)
 
@@ -213,7 +213,7 @@ def _get_sentence_embeddings(inputs: JTensor, segment_ids: JTensor) -> JTensor:
   num_elements_per_segment = jax.ops.segment_sum(
       jnp.ones_like(segment_ids), segment_ids, num_segments=max_segments)
 
-  #segment_mean shape: [max_segments, D]
+  # segment_mean shape: [max_segments, D]
   segment_mean = segment_sum / jnp.maximum(
       num_elements_per_segment[:, jnp.newaxis], 1)
   # Sentence embedding contains the average of the input tensor per segment.
@@ -258,8 +258,8 @@ class TransformerFeedForward(base_layer.BaseLayer):
         path.
       norm_policy: Policy for applying normaliztion wrt. transformations.
         Options are: (1) "pre", applied before transformation. (2)
-          "primer_hybrid", applied before and after transformation. (3) "post",
-          applied after transformation.
+        "primer_hybrid", applied before and after transformation. (3) "post",
+        applied after transformation.
       internal_gshard_variance_scaling_fan_in_init: Feedforward weight init
         follows uniform distribution withbound = 1.0 / sqrt(3 / dim_0).
     """
@@ -313,7 +313,7 @@ class TransformerFeedForward(base_layer.BaseLayer):
       # Make it compatible with previous implementation
       output_dims = p.input_dims
     else:
-      assert output_dims == p.input_dims
+      assert output_dims == p.input_dims, (p.input_dims, output_dims)
 
     wp = p.weight_split_dims_mapping
     ap = p.activation_split_dims_mapping
@@ -498,15 +498,15 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
         add_skip_connection is True.
       norm_policy: Policy for applying normaliztion wrt. transformations.
         Options are: (1) "pre", applied before transformation. (2)
-          "primer_hybrid", applied before and after transformation. (3) "post",
-          applied after transformation.
+        "primer_hybrid", applied before and after transformation. (3) "post",
+        applied after transformation.
       residual_droppath_prob: Probability at which we drop the entire residual
         path.
       gating_func: Gating function type--can be one of the following options:
         'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
         'expert_choice', based on https://arxiv.org/abs/2202.09368,
         'dense_top2': experimental gating function for decodiing. Similar to
-          'top2' gating, but no capacity constrainst for each expert.
+        'top2' gating, but no capacity constrainst for each expert.
       num_experts: Total number of experts in this layer.
       num_groups: Total number of groups for dispatching. num_groups typically
         should be the same as num devices.
@@ -519,8 +519,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
         and all routing groups. If the global batch size is G*S (num_groups*
         group_size) or B*L(batch*length) and the total expert capacity across
         all routing groups is E*G*C (num_experts*num_groups*expert_capacity),
-        then
-          unadjusted_expert_capacity_factor == (E*G*C)/(G*S)
+        then unadjusted_expert_capacity_factor == (E*G*C)/(G*S)
         unadjusted_expert_capacity_factor is set to 2 by default for top-2
         routing.
       expert_weight_shards: Shard each expert params into this many number of
@@ -892,7 +891,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
       dispatch_tensor = dispatch_tensor.astype(fprop_dtype)
 
     # both tensors have shape [g, s, e, c]
-    if p.gating_func == 'top2':
+    if p.gating_func in ['top2', 'expert_choice_v2']:
       combine_tensor = self._split(combine_tensor, ap.gsec)
       dispatch_tensor = self._split(dispatch_tensor, ap.gsec)
       expert_inputs = jnp.einsum('gsec,gsm->egcm', dispatch_tensor,
@@ -909,6 +908,27 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     hidden = jnp.einsum('egcm,emh->egch', expert_inputs, theta_wi)
     hidden = self._split(hidden, ap.egch)
 
+    if p.gating_func in ['top2', 'expert_choice_v2']:
+      threshold = 0
+      activation_class_name = p.activation_tpl.cls.__name__
+      if isinstance(p.activation_tpl.cls, activations_lib.GELU):
+        logging.info('Setting dead neuron count threshold=-3.0 '
+                     'for approximate GeLU activation')
+        threshold = -3.0
+
+      nonpadding_indicator = jnp.einsum('gsec->ec', dispatch_tensor)
+      nonpadding_indicator = nonpadding_indicator[:, jnp.newaxis, :,
+                                                  jnp.newaxis]
+      padding_indicator = 1 - nonpadding_indicator
+      hidden_minus_ten_padding_indicator = hidden - 10 * padding_indicator
+      # EG, taking max over G and C dim
+      max_hidden = jnp.max(
+          jnp.max(hidden_minus_ten_padding_indicator, axis=1), axis=1)
+      dead_neuron_indicator = jnp.less(max_hidden, threshold).astype(jnp.int32)
+      dead_neuron_count = jnp.count_nonzero(dead_neuron_indicator)
+      self.add_summary('dead_%s_count' % activation_class_name,
+                       dead_neuron_count)
+
     # Activation function.
     hidden = self.activation(hidden)
     # Dropout.
@@ -919,7 +939,7 @@ class TransformerFeedForwardMoe(base_layer.BaseLayer):
     # Now transpose and reshard.
     transposed_expert_output = jnp.einsum('egcm->gecm', expert_output)
     transposed_expert_output = self._split(transposed_expert_output, ap.gecm)
-    if p.gating_func == 'top2':
+    if p.gating_func in ['top2', 'expert_choice_v2']:
       combined_output = jnp.einsum('gecm,gsec->gsm', transposed_expert_output,
                                    combine_tensor)
     elif p.gating_func == 'expert_choice':
@@ -1027,11 +1047,11 @@ class Transformer(base_layer.BaseLayer):
         path.
       mask_self_attention: If True, use causal mask.
       cross_attention: If True, perform cross encoder-decoder attention.
-      allow_skip_cross_attention: If True, allow skipping cross attention
-        during forward pass and decoding. This allows to skip cross attention
-        when cross inputs are not available. For example, if we want to train
-        the model with paired data and unimodal data. For paired data, we need
-        cross attention but for unimodal data, we don't have cross inputs.
+      allow_skip_cross_attention: If True, allow skipping cross attention during
+        forward pass and decoding. This allows to skip cross attention when
+        cross inputs are not available. For example, if we want to train the
+        model with paired data and unimodal data. For paired data, we need cross
+        attention but for unimodal data, we don't have cross inputs.
       cross_atten_tpl: Optional cross attention params template that can be set
         when cross attention is enabled. If cross-attention is enabled and this
         is set to None, then cross-attention params will be inherited from
@@ -1039,8 +1059,8 @@ class Transformer(base_layer.BaseLayer):
       ln_tpl: Parameterization of the layer normalization layer.
       norm_policy: Policy for applying normaliztion wrt. transformations.
         Options are: (1) "pre", applied before transformation. (2)
-          "primer_hybrid", applied before and after transformation. (3) "post",
-          applied after transformation.
+        "primer_hybrid", applied before and after transformation. (3) "post",
+        applied after transformation.
       tr_atten_tpl: Parameterization of the DotProductAttention layer.
       packed_input: If True, each training example may pack multiple sequences.
       tr_fflayer_tpl: Parameterization of the transformer Feed-Forward Layer.
@@ -1058,9 +1078,9 @@ class Transformer(base_layer.BaseLayer):
     relu_dropout_prob: float = 0.0
     residual_droppath_prob: float = 0.0
     mask_self_attention: bool = False
-    cross_attention: bool = False
+    use_cross_attention: bool = False
     allow_skip_cross_attention: bool = False
-    cross_atten_tpl: Optional[BaseHParams] = None
+    cross_atten_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
     ln_tpl: BaseHParams = sub_config_field(normalizations.LayerNorm.HParams)
     norm_policy: str = 'pre'
     tr_atten_tpl: BaseHParams = sub_config_field(
@@ -1068,7 +1088,7 @@ class Transformer(base_layer.BaseLayer):
     packed_input: bool = False
     tr_fflayer_tpl: BaseHParams = sub_config_field(
         TransformerFeedForward.HParams)
-    ngrammer_tpl: Optional[BaseHParams] = None
+    ngrammer_tpl: Optional[BaseHParams] = base_layer.sub_config_field(None)
 
   def setup(self) -> None:
     p = self.hparams
@@ -1095,7 +1115,8 @@ class Transformer(base_layer.BaseLayer):
     params.num_heads = p.num_heads
     params.dim_per_head = p.dim_per_head
     params.atten_dropout_prob = p.atten_dropout_prob
-    params.ngrammer_tpl = p.ngrammer_tpl
+    if p.ngrammer_tpl:
+      params.ngrammer_tpl = p.ngrammer_tpl
     self.create_child('self_attention', params)
 
     # Initialize residual dropout.
@@ -1104,7 +1125,7 @@ class Transformer(base_layer.BaseLayer):
     self.create_child('residual_dropout', params)
 
     # Initialize multi-headed cross-attention and layer norm.
-    if p.cross_attention:
+    if p.use_cross_attention:
       if p.norm_policy in ('pre', 'post'):
         params = p.ln_tpl.clone()
         params.name = 'cross_layer_norm'
@@ -1184,19 +1205,19 @@ class Transformer(base_layer.BaseLayer):
       inputs: Input sequence JTensor of shape [B, T, H].
       paddings: Input paddings JTensor of shape [B, T] (only used in FFN layer).
       attention_mask: Self attention mask ready to add to the logits. It can be
-        of shape [B/1, 1, T/1, T] which is broadcast compatible with the self
+        of shape [1|B, 1, 1|T, T] which is broadcast compatible with the self
         attention matrix of shape [B, N, T, T]. This is assumed to have combined
         paddings, causal masking as well as segment maskings.
       cross_inputs: Output of the encoder, to be used for cross attention, of
         shape [B, S, H].
       cross_attention_mask: Cross attention mask ready to add to the logits. It
-        can be of shape [B/1, 1, T/1, S] which is broadcast compatible with the
+        can be of shape [1|B, 1, 1|T, S] which is broadcast compatible with the
         cross attention matrix of shape [B, N, T, T]. This is assumed to have
         combined paddings as well as segment maskings.
       segment_pos: A JTensor of shape [B, T]. The position of each token in a
         segment.
       segment_ids: A JTensor of shape [B, T] specifying which segment each token
-          belongs to.
+        belongs to.
 
     Returns:
       The fflayer output with shape [B, T, D].
@@ -1206,9 +1227,9 @@ class Transformer(base_layer.BaseLayer):
     p = self.hparams
 
     inputs_stats = stats.compute_stats(inputs, jnp.expand_dims(paddings, -1))
-    self.add_summary('xformer_input_mean', inputs_stats.mean_v)
-    self.add_summary('xformer_input_std', inputs_stats.std_v)
-    self.add_summary('xformer_input_abs_max', inputs_stats.max_v)
+    self.add_summary('xformer_input_mean', inputs_stats.mean_v, verbosity=3)
+    self.add_summary('xformer_input_std', inputs_stats.std_v, verbosity=3)
+    self.add_summary('xformer_input_abs_max', inputs_stats.max_v, verbosity=3)
 
     if p.norm_policy == 'primer_hybrid':
       inputs_normalized = self.pre_layer_norm(inputs)
@@ -1241,8 +1262,8 @@ class Transformer(base_layer.BaseLayer):
       atten_output += inputs
 
     # Apply cross attention if applicable
-    if p.cross_attention and (not p.allow_skip_cross_attention or
-                              cross_inputs is not None):
+    if p.use_cross_attention and (not p.allow_skip_cross_attention or
+                                  cross_inputs is not None):
       assert cross_inputs is not None
       assert cross_attention_mask is not None
       if p.norm_policy == 'pre':
@@ -1292,16 +1313,22 @@ class Transformer(base_layer.BaseLayer):
     (B // b) chunk in B correspond to multiple samples for the same cross
     # inputs.
 
+    When `inputs` has shape [B, L, D], it will do extend_step on N tokenks per
+    batch. This is used to do suffix scoring after autoregressive decoding.
+
+    When `inputs` has shape [B, D], it will do extend_step on one token per
+    batch in regular autoregressive decoding.
+
     Args:
-      inputs: Target sequence of shape [B, D] corresponding to target sequence
-        at index time_step.
+      inputs: Target sequence of shape [B, D] or [B, L, D] corresponding to
+        target sequence at index time_step.
       time_step: A scalar, the current decode step, 0-based.
       attention_mask: per step attention mask for this time step, of shape [B,
         1, T]. This combines causal mask with any segment mask if applicable.
       segment_pos: An optional JTensor of shape [B]. Current position in the
         same segment. If unspecified, time_step will be used.
       cross_attention_mask: if not None, cross_segment_mask for this time step,
-        of shape [b/B, 1, 1, S]. This combines padding mask with any segment
+        of shape [b|B, 1, 1, S]. This combines padding mask with any segment
         mask if applicable.
 
     Returns:
@@ -1330,8 +1357,8 @@ class Transformer(base_layer.BaseLayer):
     atten_output += inputs
 
     # Apply cross attention if applicable
-    if p.cross_attention and (not p.allow_skip_cross_attention or
-                              cross_attention_mask is not None):
+    if p.use_cross_attention and (not p.allow_skip_cross_attention or
+                                  cross_attention_mask is not None):
       assert cross_attention_mask is not None
       if p.norm_policy == 'pre':
         atten_output_normalized = self.cross_layer_norm(atten_output)
@@ -1395,7 +1422,8 @@ class StackedTransformer(base_layer.BaseLayer):
     """Associated hyper-params for this layer class.
 
     Attributes:
-      cross_attention: If set, introduces cross encoder-decoder attention layer.
+      use_cross_attention: If True, introduces cross encoder-decoder attention
+        layer.
       mask_self_attention: Use masked self-attention.
       num_layers: Number of layers in this stack.
       model_dims: Model dimension in Transformer layers.
@@ -1406,11 +1434,13 @@ class StackedTransformer(base_layer.BaseLayer):
       dropout_prob: Apply dropout at this prob at various places.
       residual_droppath_prob: Probability at which we drop the entire residual
         path.
+      input_dropout_prob: Dropout probability applied to the input before any
+        processing happens.
       gating_func: Gating function type--can be one of the following options:
         'top2', based on the GShard paper: https://arxiv.org/abs/2006.16668,
         'expert_choice', based on https://arxiv.org/abs/2202.09368,
         'dense_top2': experimental gating function for decodiing. Similar to
-          'top2' gating, but no capacity constrainst for each expert.
+        'top2' gating, but no capacity constrainst for each expert.
       unadjusted_expert_capacity_factor: Unadjusted expert capacity_factor. This
         is the ratio between global batch size and total capacity across all
         experts and all routing groups.
@@ -1434,7 +1464,7 @@ class StackedTransformer(base_layer.BaseLayer):
         entry in the sequence is None, then there is no NGrammer layer present
         in that corresponding layer.
     """
-    cross_attention: bool = False
+    use_cross_attention: bool = False
     mask_self_attention: bool = False
     num_layers: int = 0
     model_dims: int = 0
@@ -1442,11 +1472,16 @@ class StackedTransformer(base_layer.BaseLayer):
     num_heads: int = 0
     dim_per_head: Optional[int] = None
     dropout_prob: float = 0.0
+    atten_dropout_prob: Optional[float] = None
+    residual_dropout_prob: Optional[float] = None
+    relu_dropout_prob: Optional[float] = None
     residual_droppath_prob: float = 0.0
+    input_dropout_prob: float = 0.0
     gating_func: str = 'top2'
     unadjusted_expert_capacity_factor: float = 2.0
-    transformer_layer_params_tpl: BaseHParams = sub_config_field(
-        Transformer.HParams)
+    transformer_layer_params_tpl: Union[
+        BaseHParams,
+        Sequence[BaseHParams]] = sub_config_field(Transformer.HParams)
     packed_input: bool = False
     fold_padding_with_segment_mask: bool = False
     moe_layer_tpl: BaseHParams = sub_config_field(
@@ -1455,7 +1490,7 @@ class StackedTransformer(base_layer.BaseLayer):
     num_groups: int = 1
     min_group_size: Optional[int] = None
     moe_layers: Optional[Sequence[int]] = ()
-    ngrammer_tpls: Optional[Sequence[BaseHParams]] = None
+    ngrammer_tpls: Optional[Sequence[BaseHParams]] = sub_config_field(None)
 
   def setup(self) -> None:
     p = self.hparams
@@ -1465,20 +1500,26 @@ class StackedTransformer(base_layer.BaseLayer):
     assert p.hidden_dims > 0
     assert p.num_heads > 0
     assert 0.0 <= p.dropout_prob < 1.0
+    assert 0.0 <= p.input_dropout_prob < 1.0
 
     def _layer_params(i):
       """Construct i-th layer params."""
-      p_i = p.transformer_layer_params_tpl.clone()
+      if isinstance(p.transformer_layer_params_tpl, (list, tuple)):
+        factor = p.num_layers // len(p.transformer_layer_params_tpl)
+        ii = i // factor
+        p_i = p.transformer_layer_params_tpl[ii].clone()
+      else:
+        p_i = p.transformer_layer_params_tpl.clone()
       p_i.name = f'layer_{i}'
-      p_i.cross_attention = p.cross_attention
+      p_i.use_cross_attention = p.use_cross_attention
       p_i.mask_self_attention = p.mask_self_attention
       p_i.num_heads = p.num_heads
       p_i.dim_per_head = p.dim_per_head
       p_i.input_dims = p.model_dims
       p_i.packed_input = p.packed_input
-      p_i.atten_dropout_prob = p.dropout_prob
-      p_i.residual_dropout_prob = p.dropout_prob
-      p_i.relu_dropout_prob = p.dropout_prob
+      p_i.atten_dropout_prob = p.atten_dropout_prob or p.dropout_prob
+      p_i.residual_dropout_prob = p.residual_dropout_prob or p.dropout_prob
+      p_i.relu_dropout_prob = p.relu_dropout_prob or p.dropout_prob
       p_i.hidden_dims = p.hidden_dims
 
       if p.residual_droppath_prob > 0.0:
@@ -1502,8 +1543,18 @@ class StackedTransformer(base_layer.BaseLayer):
           p_i.ngrammer_tpl = p.ngrammer_tpls[i]
       return p_i
 
+    if isinstance(p.transformer_layer_params_tpl, (list, tuple)):
+      if p.num_layers % len(p.transformer_layer_params_tpl):
+        raise ValueError('num_layers should be divisible by '
+                         'transformer_layer_params_tpl')
+
     layer_params = [_layer_params(i) for i in range(p.num_layers)]
     self.create_children('x_layers', layer_params)
+
+    if p.input_dropout_prob > 0.0:
+      self.create_child(
+          'input_dropout',
+          stochastics.Dropout.HParams(keep_prob=1.0 - p.input_dropout_prob))
 
   def init_states(self, *args: Any, **kwargs: Any) -> None:
     """Initialize the cache for the StackedTransformer layer.
@@ -1547,7 +1598,7 @@ class StackedTransformer(base_layer.BaseLayer):
     if p.packed_input:
       assert segment_mask is not None
 
-    if p.cross_attention:
+    if p.use_cross_attention:
       assert cross_inputs is not None
       assert cross_paddings is not None
       if p.packed_input:
@@ -1562,6 +1613,9 @@ class StackedTransformer(base_layer.BaseLayer):
         cross_paddings,
         cross_segment_mask,
         fold_padding_with_segment_mask=p.fold_padding_with_segment_mask)
+
+    if p.input_dropout_prob > 0.0:
+      x_out = self.input_dropout(x_out)
 
     for i in range(p.num_layers):
       x_in = x_out
@@ -1579,19 +1633,30 @@ class StackedTransformer(base_layer.BaseLayer):
                   *,
                   time_step: JTensor,
                   segment_pos: Optional[JTensor] = None,
+                  atten_mask: Optional[JTensor] = None,
                   cross_paddings: Optional[JTensor] = None,
                   cross_segment_mask: Optional[JTensor] = None) -> JTensor:
     """Transformer stacked decoder layers, autoregressive cached decoding.
 
+    When `inputs` has shape [B, L, D], it will do extend_step on N tokenks per
+    batch. This is used to do suffix scoring after autoregressive decoding.
+
+    When `inputs` has shape [B, D], it will do extend_step on one token per
+    batch in regular autoregressive decoding.
+
     Args:
-      inputs: Target sequence of shape [B, D] corresponding to target sequence
-        at index time_step.
+      inputs: Target sequence of shape [B, D] or [B, L, D] corresponding to
+        target sequence at index time_step.
       time_step: A scalar, the current decode step, 0-based.
-      segment_pos: An optional JTensor of shape [B]. Current position in the
-        same segment. If unspecified, time_step will be used.
-      cross_paddings: Source paddings - [b/B, S].
+      segment_pos: An optional JTensor of shape [B], or [B, L]. Current position
+        in the same segment. If unspecified, time_step will be used.
+      atten_mask: An optional JTensor of shape [B, 1, L, S] for attention mask
+        between inputs and the whole sequence. If it is None, it will be
+        computed as a causal mask on a contiguous sequence. This passed in
+        atten_mask is unsupported with cross-attention.
+      cross_paddings: Source paddings - [b|B, S].
       cross_segment_mask: if not None, cross_segment_mask for this time step, of
-        shape [b/B, 1, S].
+        shape [b|B, 1, S].
 
     Returns:
       decoder_output: The last decoder layer output of shape [B, D].
@@ -1600,30 +1665,38 @@ class StackedTransformer(base_layer.BaseLayer):
 
     max_t = self.x_layers[0].self_attention.decoding_state_sequence_length()
 
-    if p.cross_attention:
+    if p.use_cross_attention:
       assert cross_paddings is not None
 
-    if segment_pos is None:
-      segment_mask = None
-    else:
-      # Calculate the segment mask for this step. We assume the segment is
-      # contiguous.
-      segment_pos_2d = jnp.expand_dims(segment_pos, 1)
-      # [B, T]
-      source_positions = jnp.arange(max_t)[
-          jnp.newaxis, :] - time_step + segment_pos_2d
-      # [B, T]
-      source_segment_ids = jnp.where(source_positions < 0, 0, 1)
-      # [B, 1, 1, T]
-      segment_mask = attentions.segment_mask(
-          jnp.ones_like(segment_pos_2d), source_segment_ids, inputs.dtype)
-      # [B, 1, T]
-      segment_mask = jnp.squeeze(segment_mask, 1)
+    if atten_mask is None:
+      if segment_pos is None:
+        segment_mask = None
+      else:
+        # Calculate the segment mask for this step. We assume the segment is
+        # contiguous.
+        segment_pos_2d = jnp.expand_dims(segment_pos, 1)
+        # [B, T]
+        source_positions = jnp.arange(max_t)[
+            jnp.newaxis, :] - time_step + segment_pos_2d
+        # [B, T]
+        source_segment_ids = jnp.where(source_positions < 0, 0, 1)
+        # [B, 1, 1, T]
+        segment_mask = attentions.segment_mask(
+            jnp.ones_like(segment_pos_2d), source_segment_ids, inputs.dtype)
+        # [B, 1, T]
+        segment_mask = jnp.squeeze(segment_mask, 1)
 
-    attention_mask, cross_attention_mask = (
-        compute_attention_masks_for_extend_step(time_step, max_t, segment_mask,
-                                                cross_paddings,
-                                                cross_segment_mask))
+      attention_mask, cross_attention_mask = (
+          compute_attention_masks_for_extend_step(time_step, max_t,
+                                                  segment_mask, cross_paddings,
+                                                  cross_segment_mask))
+    else:
+      if p.use_cross_attention:
+        raise NotImplementedError('cross attention does not support customized '
+                                  'attention_mask passed in yet.')
+
+      attention_mask = atten_mask
+      cross_attention_mask = None
 
     decoder_input = inputs
     for layer in self.x_layers:
@@ -1702,7 +1775,7 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
     wp = p.weight_split_dims_mapping
 
     repeat_l_params = repeats.Repeat.HParams(
-        sub=p.block,
+        sub_tpl=p.block,
         x_times=p.x_times,
         checkpoint_policy=p.checkpoint_policy,
         unpack_summaries=True,
@@ -1763,9 +1836,16 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
                   *,
                   time_step: JTensor,
                   segment_pos: Optional[JTensor] = None,
+                  atten_mask: Optional[JTensor] = None,
                   cross_paddings: Optional[JTensor] = None,
                   cross_segment_mask: Optional[JTensor] = None) -> JTensor:
     """Transformer stacked decoder layers, autoregressive cached decoding.
+
+    When `inputs` has shape [B, L, D], it will do extend_step on N tokenks per
+    batch. This is used to do suffix scoring after autoregressive decoding.
+
+    When `inputs` has shape [B, D], it will do extend_step on one token per
+    batch in regular autoregressive decoding.
 
     Args:
       inputs: Target sequence of shape [B, D] corresponding to target sequence
@@ -1773,9 +1853,13 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
       time_step: A scalar, the current decode step, 0-based.
       segment_pos: An optional JTensor of shape [B]. Current position in the
         same segment. If unspecified, time_step will be used.
-      cross_paddings: Source paddings - [b/B, S].
+      atten_mask: An optional JTensor of shape [B, 1, L, S] for attention mask
+        between inputs and the whole sequence. If it is None, it will be
+        computed as a causal mask on a contiguous sequence. This passed in
+        atten_mask is unsupported with cross-attention.
+      cross_paddings: Source paddings - [b|B, S].
       cross_segment_mask: if not None, cross_segment_mask for this time step, of
-        shape [b/B, 1, S].
+        shape [b|B, 1, S].
 
     Returns:
       decoder_output: The last decoder layer output of shape [B, D].
@@ -1785,6 +1869,7 @@ class StackedTransformerRepeated(base_layer.BaseLayer):
         inputs,
         time_step=time_step,
         segment_pos=segment_pos,
+        atten_mask=atten_mask,
         cross_paddings=cross_paddings,
         cross_segment_mask=cross_segment_mask)
 
@@ -1831,9 +1916,9 @@ class PipelinedTransformer(base_layer.BaseLayer):
       pipeline_microbatch_size: Size of each pipeline microbatch.
       stream_io: Whether to enable input/output streaming across stages. This is
         typically useful for DCN.
-      pipeline_broadcast_inputs: If true, broadcast inputs (shared between
-        all stages instead of being computed by the previous stage) will be
-        passed stage-by-stage instead of being replicated.
+      pipeline_broadcast_inputs: If true, broadcast inputs (shared between all
+        stages instead of being computed by the previous stage) will be passed
+        stage-by-stage instead of being replicated.
     """
     pipeline_stage: BaseHParams = sub_config_field(StackedTransformer.HParams)
     circular_repeat: int = 1

@@ -184,7 +184,8 @@ class FullSoftmax(base_layer.BaseLayer):
     input_dims: int = 0
     num_classes: int = 0
     soft_cap_logits: Optional[float] = 0.0
-    bi_tempered_loss: Optional[BaseHParams] = None
+    bi_tempered_loss_tpl: Optional[BaseHParams] = base_layer.sub_config_field(
+        None)
     label_smoothing_prob: float = 0.0
     label_smoothing_apply_for_eval: bool = True
     z_loss_weight: float = 0.
@@ -205,8 +206,8 @@ class FullSoftmax(base_layer.BaseLayer):
         weight_split_dims_mapping=wp.clone(),
         activation_split_dims_mapping=ap.clone())
     self.create_child('logits_ffn', ff_p)
-    if p.bi_tempered_loss:
-      self.create_child('bi_tempered_loss', p.bi_tempered_loss)
+    if p.bi_tempered_loss_tpl:
+      self.create_child('bi_tempered_loss', p.bi_tempered_loss_tpl)
 
   def get_logits(self, inputs: JTensor) -> JTensor:
     """Returns logits given the inputs with an option to soft cap it.
@@ -258,6 +259,8 @@ class FullSoftmax(base_layer.BaseLayer):
       - total_xent: A scalar. The sum of per_example_weight * per_example_xent.
       - total_weight: A scalar. The sum of per_example_weight.
       - avg_xent: A scalar. total_loss / total_weight.
+      - z_loss [optional]: A scalar. The square of logsum logits when 
+        z_loss_weight > 0.
     """
     p = self.hparams
     # Assert one of class_ids or class_probabilities is not None
@@ -287,7 +290,7 @@ class FullSoftmax(base_layer.BaseLayer):
               other_prob * (1.0 - class_probabilities)).astype(jnp.float32)
       class_probabilities = jax.lax.stop_gradient(class_probabilities)
 
-    if p.bi_tempered_loss is None:
+    if p.bi_tempered_loss_tpl is None:
       per_example_xent = -jnp.sum(
           log_probs * class_probabilities, axis=-1, dtype=jnp.float32)
     else:
@@ -316,7 +319,8 @@ class FullSoftmax(base_layer.BaseLayer):
         total_xent=total_xent,
         total_weight=total_weight,
         avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32))
-
+    if p.z_loss_weight > 0.0:
+      output_nmap['z_loss'] = z_loss
     return output_nmap
 
 
@@ -786,6 +790,15 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
   The Rotary position embedding is described in https://arxiv.org/abs/2104.09864
   """
 
+  class HParams(PositionalEmbedding.HParams):
+    """Associated hyper-params for this layer class.
+
+    Attributes:
+      cast_as_fprop_dtype: If True, the returned vars are cast as fprop_dtype
+      to save some memory.
+    """
+    cast_as_fprop_dtype: bool = True
+
   def __call__(self,
                inputs: JTensor,
                position: Optional[JTensor] = None) -> JTensor:
@@ -825,8 +838,12 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     sin = jnp.sin(sinusoid_inp)
     cos = jnp.cos(sinusoid_inp)
     first_half, second_half = jnp.split(inputs, 2, axis=-1)
-    first_part = first_half * cos - second_half * sin
-    second_part = second_half * cos + first_half * sin
+    first_part = (first_half * cos - second_half * sin)
+    second_part = (second_half * cos + first_half * sin)
+    # TODO(b/252874053): Clean this up after phase 3 is done.
+    if p.cast_as_fprop_dtype:
+      first_part = first_part.astype(self.fprop_dtype)
+      second_part = second_part.astype(self.fprop_dtype)
     return jnp.concatenate([first_part, second_part], axis=-1)
 
   def extend_step(self,

@@ -32,7 +32,7 @@ D = hidden dims
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Sequence
 
 import einops
 import jax
@@ -54,6 +54,8 @@ NestedMap = py_utils.NestedMap
 JTensor = pytypes.JTensor
 
 BaseHParams = base_layer.BaseLayer.HParams
+WeightHParams = base_layer.WeightHParams
+WeightInit = base_layer.WeightInit
 sub_config_field = base_hyperparams.sub_config_field
 
 
@@ -90,6 +92,40 @@ def image_to_patch(img: JTensor, patch_size: int) -> JTensor:
       q=patch_size,
       c=channels)
   return img
+
+
+def patch_to_image(patches: JTensor, img_shape: Sequence[int], patch_size: int):
+  """Converts patches to an image with the given image shape and the patch size.
+
+  Args:
+    patches: JTensor, [batch_size, num_patches, patch_content].
+    img_shape: A sequence of 4 integers specifying
+      [batch_size, image_height, image_width, image_channel].
+    patch_size: An integer specifying the patch size.
+
+  Returns:
+    The image converted from patches of the shape specified by img_shape.
+  """
+  if len(img_shape) != 4:
+    raise ValueError(
+        f'Image shape is expected to be [B, H, W, C], got {img_shape}.')
+  height, width, channels = img_shape[1:]
+
+  if height % patch_size != 0 or width % patch_size != 0:
+    raise ValueError(
+        f'Image height ({height}) and width ({width}) should be multiples '
+        f'of patch_size ({patch_size}).')
+
+  row_blocks = height // patch_size
+  column_blocks = width // patch_size
+  return einops.rearrange(
+      patches,
+      '... (m n)(p q c) -> ... (m p)(n q) c',
+      m=row_blocks,
+      n=column_blocks,
+      p=patch_size,
+      q=patch_size,
+      c=channels)
 
 
 def interpolate_embedding_2d(emb, source_emb_shape, target_emb_shape):
@@ -141,40 +177,56 @@ class VitEntryLayers(base_layer.BaseLayer):
         used to support images of different shapes. When the embedding_size is
         not equal to image_size / patch_size, interpolation will be employed to
         generate embeddings of image_size / patch_size.
-      patch_size: Height/width of a square patch.
-      dim_per_patch: Number of channels per patch after pachifying.
+      input_dims: Dims per patch before input patch projection.
+      output_dims: Dims per patch after input patch projection.
       image_channels: Number of channels of the input image.
+      prepend_cls_tokens: If > 0, the layer will prepend N CLS token before
+        the patch features.
+      append_cls_tokens: If > 0, the layer will append N CLS token after
+        the patch features.
+      pos_emb_tpl: template for positional embeddings.
     """
     pos_embed_shapes: Tuple[int, int] = (0, 0)
     patch_size: int = 0
-    dim_per_patch: int = 0
-    image_channels: int = 3
+    input_dims: int = 0
+    output_dims: int = 0
     pos_emb_dropout_prob: float = 0.0
+    prepend_cls_tokens: int = 0
+    append_cls_tokens: int = 0
+    # configurable components
+    pos_emb_tpl: BaseHParams = sub_config_field(
+        embedding_softmax.TrainablePositionalEmbedding.HParams)
 
   def setup(self) -> None:
     p = self.hparams
 
     p_patch_projection = linears.FeedForward.HParams(
         name='proj',
-        input_dims=p.patch_size**2 * p.image_channels,
-        output_dims=p.dim_per_patch,
+        input_dims=p.input_dims,
+        output_dims=p.output_dims,
         activation_tpl=activations.Identity.HParams())
     self.create_child('patch_projection', p_patch_projection)
 
-    num_patches = np.prod(p.pos_embed_shapes)
-
-    p_emb = embedding_softmax.TrainablePositionalEmbedding.HParams(
-        name='emb',
-        max_seq_length=num_patches,
-        embedding_dims=p.dim_per_patch,
-        params_init=base_layer.WeightInit.Gaussian(scale=0.02))
-
-    self.create_child('pos_emb', p_emb)
+    pos_emb = p.pos_emb_tpl.clone().set(name='emb')
+    self.create_child('pos_emb', pos_emb)
 
     if p.pos_emb_dropout_prob > 0.0:
       p_dropout = stochastics.Dropout.HParams(
           name='dropout', keep_prob=1.0 - p.pos_emb_dropout_prob)
       self.create_child('dropout', p_dropout)
+
+    if p.prepend_cls_tokens > 0:
+      self.create_variable(
+          'prepend_cls_embs',
+          WeightHParams(
+              shape=[1, p.prepend_cls_tokens, p.output_dims],
+              init=WeightInit.Constant(0.0)))
+    if p.append_cls_tokens > 0:
+      self.create_variable(
+          'append_cls_embs',
+          WeightHParams(
+              shape=[1, p.append_cls_tokens, p.output_dims],
+              init=WeightInit.Constant(0.0)))
 
   def __call__(self, inputs: JTensor) -> JTensor:
     """Applies the vit entry operations to the input image.
@@ -203,20 +255,40 @@ class VitEntryLayers(base_layer.BaseLayer):
 
     features = self.patch_projection(patches)
 
-    num_patches = np.prod(p.pos_embed_shapes)
-    pos_emb = self.pos_emb(seq_length=num_patches)
+    num_pos_embed = np.prod(p.pos_embed_shapes)
+    num_pos_embed += p.prepend_cls_tokens
+    num_pos_embed += p.append_cls_tokens
+    pos_emb = self.pos_emb(seq_length=num_pos_embed)
+
+    prepend_cls_pos_emb = pos_emb[:, :p.prepend_cls_tokens, :]
+    input_pos_emb = pos_emb[:, p.prepend_cls_tokens:num_pos_embed -
+                            p.append_cls_tokens]
+    append_cls_pos_emb = pos_emb[:, -p.append_cls_tokens:, :]
 
     # Only support image shape for pos interpolation.
     if len(inputs.shape) == 4:
       row_patch_count = height // p.patch_size
       col_patch_count = width // p.patch_size
       if p.pos_embed_shapes != (row_patch_count, col_patch_count):
-        pos_emb = interpolate_embedding_2d(pos_emb, p.pos_embed_shapes,
-                                           (row_patch_count, col_patch_count))
+        input_pos_emb = interpolate_embedding_2d(
+            input_pos_emb, p.pos_embed_shapes,
+            (row_patch_count, col_patch_count))
 
-    features = features + pos_emb
+    features = features + input_pos_emb
     if self.hparams.pos_emb_dropout_prob > 0.0:
       features = self.dropout(features)
+
+    batch_size = inputs.shape[0]
+    if p.prepend_cls_tokens > 0:
+      prepend_cls_embs = jnp.tile(self.theta.prepend_cls_embs,
+                                  (batch_size, 1, 1))
+      prepend_cls_embs = prepend_cls_embs + prepend_cls_pos_emb
+      features = jnp.concatenate((prepend_cls_embs, features), axis=1)
+
+    if p.append_cls_tokens > 0:
+      append_cls_embs = jnp.tile(self.theta.append_cls_embs, (batch_size, 1, 1))
+      append_cls_embs = append_cls_embs + append_cls_pos_emb
+      features = jnp.concatenate((features, append_cls_embs), axis=1)
 
     return features
 
@@ -235,6 +307,7 @@ class VitExitLayers(base_layer.BaseLayer):
       output_dim: Number of channels of the output tensor.
       output_dropout_prob: Probability to apply dropout on the output tensor.
       pooled: Global max pooling over all output tokens.
+      pre_ln: If true, add a layer norm at the beginning of this layer.
       output_fc_tanh: Whether to include a linear projection layer with tanh
         activation on the output.
     """
@@ -242,13 +315,15 @@ class VitExitLayers(base_layer.BaseLayer):
     output_dim: int = 0
     output_dropout_prob: float = 0.0
     pooled: bool = True
+    pre_ln: bool = True
     output_fc_tanh: bool = True
 
   def setup(self) -> None:
     p = self.hparams
 
-    p_ln = normalizations.LayerNorm.HParams(name='ln', dim=p.hidden_dim)
-    self.create_child('ln', p_ln)
+    if p.pre_ln:
+      p_ln = normalizations.LayerNorm.HParams(name='ln', dim=p.hidden_dim)
+      self.create_child('ln', p_ln)
 
     if p.pooled:
       p_pooling = poolings.GlobalPooling.HParams(
@@ -261,9 +336,12 @@ class VitExitLayers(base_layer.BaseLayer):
           output_dims=p.output_dim,
           activation_tpl=activations.Tanh.HParams())
       self.create_child('fc_tanh', p_fc_tanh)
-    elif p.hidden_dim != p.output_dim:
-      raise ValueError('When there is no linear projection, hidden_dim must '
-                       'be equal to output_dim.')
+    elif p.output_dim != 0 and p.hidden_dim != p.output_dim:
+      p_fc = linears.FeedForward.HParams(
+          input_dims=p.hidden_dim,
+          output_dims=p.output_dim,
+          activation_tpl=activations.Identity.HParams())
+      self.create_child('output_projection', p_fc)
 
     if p.output_dropout_prob > 0.0:
       p_dropout = stochastics.Dropout.HParams(keep_prob=1.0 -
@@ -279,12 +357,17 @@ class VitExitLayers(base_layer.BaseLayer):
     Returns:
       Output tensor of shape [B, D] or [B, N, D] if pooled == False.
     """
-    inputs = self.ln(inputs)
-    if self.hparams.pooled:
+    p = self.hparams
+    if p.pre_ln:
+      inputs = self.ln(inputs)
+    if p.pooled:
       inputs = self.pooling(inputs)
-    if self.hparams.output_fc_tanh:
+    if p.output_fc_tanh:
       inputs = self.fc_tanh(inputs)
-    if self.hparams.output_dropout_prob > 0.0:
+    elif p.output_dim != 0 and p.hidden_dim != p.output_dim:
+      inputs = self.output_projection(inputs)
+
+    if p.output_dropout_prob > 0.0:
       inputs = self.dropout(inputs)
     return inputs
 
@@ -371,12 +454,18 @@ def build_vision_transformer_hparams_for_test(
   Returns:
     A HParams of the VisionTransformer layer.
   """
+  pos_emb_tpl = embedding_softmax.TrainablePositionalEmbedding.HParams(
+      max_seq_length=np.prod(pos_embed_shapes),
+      embedding_dims=model_dims,
+      params_init=base_layer.WeightInit.Gaussian(scale=0.02),
+  )
   p_entry = VitEntryLayers.HParams(
       name='entry',
       pos_embed_shapes=pos_embed_shapes,
       patch_size=patch_size,
-      dim_per_patch=model_dims,
-      image_channels=image_channels,
+      input_dims=patch_size ** 2 * image_channels,
+      output_dims=model_dims,
+      pos_emb_tpl=pos_emb_tpl,
   )
 
   p_stacked_tfm = transformers.StackedTransformer.HParams(
@@ -384,7 +473,7 @@ def build_vision_transformer_hparams_for_test(
       hidden_dims=mlp_dims,
       num_heads=num_heads,
       mask_self_attention=False,
-      cross_attention=False,
+      use_cross_attention=False,
       packed_input=False,
       num_layers=num_xformer_layers,
   )

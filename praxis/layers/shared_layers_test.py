@@ -78,9 +78,14 @@ class SharedLayersTest(test_utils.TestCase):
     initial_vars = foo_shared.init(prng_key, inputs)
     logging.info('initial_vars=%s', initial_vars)
 
+    # Note: foo_shared.linear1 has the name 'linear' before the Fiddle
+    # migration, but the name changes to 'linear1' after the migration.
+    # TODO(b/249483164): Replace linear_name w/ 'linear1' after migration.
+    linear_name = 'linear' if 'linear' in initial_vars['params'] else 'linear1'
+
     expected_shape = {
         'params': {
-            'linear': {
+            linear_name: {
                 'w': (2, 2)
             },
             'linear_private': {
@@ -96,7 +101,7 @@ class SharedLayersTest(test_utils.TestCase):
 
     shared_sublayer_initial_vars = {
         'params': {
-            'w': initial_vars['params']['linear']['w']
+            'w': initial_vars['params'][linear_name]['w']
         }
     }
     private_sublayer_initial_vars = {
@@ -129,8 +134,9 @@ class SharedLayersTest(test_utils.TestCase):
 
     # This is the actual value of input_dims and output_dims, not the default
     # values.
-    self.assertEqual(2, hyper_params['linear']['_hparams'].input_dims)
-    self.assertEqual(2, hyper_params['linear']['_hparams'].output_dims)
+    self.assertEqual(2, hyper_params[linear_name]['_hparams'].input_dims)
+    self.assertEqual(2,
+                     hyper_params[linear_name]['_hparams'].output_dims)
 
     logging.info('hyper_params: \n%s',
                  base_hyperparams.nested_struct_to_text(hyper_params))
@@ -140,13 +146,13 @@ class SimpleShared01(base_layer.BaseLayer):
   """A layer to test weight sharing."""
 
   class HParams(BaseHParams):
-    sub1: BaseHParams = None
-    sub2: BaseHParams = None
+    sub1_tpl: BaseHParams = sub_config_field(None)
+    sub2_tpl: BaseHParams = sub_config_field(None)
 
   def setup(self) -> None:
     p = self.hparams
-    self.create_child('sub1', p.sub1)
-    self.create_child('sub2', p.sub2)
+    self.create_child('sub1', p.sub1_tpl)
+    self.create_child('sub2', p.sub2_tpl)
 
   def __call__(self, x_in):
     return self.sub2(self.sub1(x_in))
@@ -159,7 +165,7 @@ class SharedLayerTest(test_utils.TestCase):
     # Share the entire FeedForward layer.
     sub_params.shared_weight_layer_id = 'shared_layer'
     test_layer_p = SimpleShared01.HParams(
-        name='test', sub1=sub_params.clone(), sub2=sub_params.clone())
+        name='test', sub1_tpl=sub_params.clone(), sub2_tpl=sub_params.clone())
     x_in = jnp.ones([2, 8])
     with base_layer.JaxContext.new_context():
       prng_key = jax.random.PRNGKey(1234)
@@ -197,7 +203,7 @@ class SharedLayerTest(test_utils.TestCase):
     # Only share the linear projection, not the entire FeedForward layer.
     sub_params.linear_tpl.shared_weight_layer_id = 'shared_weight'
     test_layer_p = SimpleShared01.HParams(
-        name='test', sub1=sub_params.clone(), sub2=sub_params.clone())
+        name='test', sub1_tpl=sub_params.clone(), sub2_tpl=sub_params.clone())
     x_in = jnp.ones([2, 8])
     with base_layer.JaxContext.new_context():
       prng_key = jax.random.PRNGKey(1234)
@@ -240,11 +246,11 @@ class SharedLayerTest(test_utils.TestCase):
     # Share the linear projection.
     sub_params.linear_tpl.shared_weight_layer_id = 'shared_linear'
     parent_p = SimpleShared01.HParams(
-        sub1=sub_params.clone(), sub2=sub_params.clone())
+        sub1_tpl=sub_params.clone(), sub2_tpl=sub_params.clone())
     # Share parent nodes.
     parent_p.shared_weight_layer_id = 'shared'
     root_layer_p = SimpleShared01.HParams(
-        name='root', sub1=parent_p.clone(), sub2=parent_p.clone())
+        name='root', sub1_tpl=parent_p.clone(), sub2_tpl=parent_p.clone())
     x_in = jnp.ones([2, 8])
     with base_layer.JaxContext.new_context():
       prng_key = jax.random.PRNGKey(1234)
