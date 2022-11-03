@@ -13,19 +13,6 @@ steps:
   entrypoint: 'bash'
   args: ['-c', 'source praxis/pip_package/collect_wheels.sh && collect_wheels ${_RELEASE_VERSION}']
 
-- name: python
-  entrypoint: pip
-  args: ["install", "twine keyrings.google-artifactregistry-auth", "--user"]
-- name: python
-  entrypoint: python
-  args:
-  - '-m'
-  - 'twine'
-  - 'upload'
-  - '--repository-url'
-  - 'testpypi'
-  - 'praxis-*.whl'
-
 substitutions:
     _PYTHON_VERSION: '3.8'
     _RELEASE_VERSION: '0.2.0'  # or rX.Y
@@ -34,3 +21,7 @@ options:
     dynamic_substitutions: true
     substitution_option: 'ALLOW_LOOSE'
 timeout: 24000s
+artifacts:
+  objects:
+    location: 'gs://pax-on-cloud-tpu-project/wheels/$(date -u +%Y%m%d)-${_RELEASE_VERSION}'
+    paths: ['/**/*.whl', '/**/*.txt']
