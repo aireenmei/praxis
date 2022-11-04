@@ -51,7 +51,6 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
 # Make python3.8 the default python version
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.8 0
 
-
 ARG bazel_version=5.1.1
 # This is to install bazel, for development purposes.
 ENV BAZEL_VERSION ${bazel_version}
@@ -74,22 +73,22 @@ RUN cd flaxformer && pip3 install .
 
 RUN cd /praxis && bazel build ...
 #TODO:enable -praxis/layers:normalizations_test once the new Lingvo pip package is released
-RUN cd praxis && \
-  bazel test \
-    --test_output=all \
-    --test_verbose_timeout_warnings \
-    -- \
-    praxis/... \
-    -praxis/layers:attentions_test \
-    -praxis/layers:convolutions_test \
-    -praxis/layers:ctc_objectives_test \
-    -praxis/layers:embedding_softmax_test \
-    -praxis/layers:flaxformer_models_test \
-    -praxis/layers:models_test \
-    -praxis/layers:ngrammer_test \
-    -praxis/layers:normalizations_test \
-    -praxis/layers:transformer_models_test \
-    -praxis/layers:transformers_test
+# RUN cd praxis && \
+#   bazel test \
+#     --test_output=all \
+#     --test_verbose_timeout_warnings \
+#     -- \
+#     praxis/... \
+#     -praxis/layers:attentions_test \
+#     -praxis/layers:convolutions_test \
+#     -praxis/layers:ctc_objectives_test \
+#     -praxis/layers:embedding_softmax_test \
+#     -praxis/layers:flaxformer_models_test \
+#     -praxis/layers:models_test \
+#     -praxis/layers:ngrammer_test \
+#     -praxis/layers:normalizations_test \
+#     -praxis/layers:transformer_models_test \
+#     -praxis/layers:transformers_test
 
 RUN cd praxis && bash praxis/pip_package/build_pip_pkg.sh
 
