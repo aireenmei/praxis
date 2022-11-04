@@ -13,3 +13,4 @@ RUN cd /praxis && bazel test --test_output=all --test_verbose_timeout_warnings -
 WORKDIR /
 
 CMD ["/bin/bash"]
+
