@@ -67,13 +67,30 @@ RUN mkdir /bazel && \
 COPY . /praxis
 RUN mkdir /tmp/paxml_pip_package_build/
 
-RUN pip3 install praxis/pip_package
+RUN pip3 install /praxis/praxis/pip_package
 
 RUN git clone https://github.com/google/flaxformer.git
 RUN cd flaxformer && pip3 install .
 
+RUN cd /praxis && bazel build ...
 #TODO:enable -praxis/layers:normalizations_test once the new Lingvo pip package is released
-RUN cd praxis && bazel test --test_output=all --test_verbose_timeout_warnings -- praxis/... -praxis/layers:transformer_models_test -praxis/layers:flaxformer_models_test -praxis/layers:ngrammer_test -praxis/layers:attentions_test -praxis/layers:transformers_test -praxis/layers:models_test -praxis/layers:convolutions_test -praxis/layers:embedding_softmax_test -praxis/layers:ctc_objectives_test -praxis/layers:normalizations_test
+RUN cd praxis && \
+  bazel test \
+    --test_output=all \
+    --test_verbose_timeout_warnings \
+    -- \
+    praxis/... \
+    -praxis/layers:attentions_test \
+    -praxis/layers:convolutions_test \
+    -praxis/layers:ctc_objectives_test \
+    -praxis/layers:embedding_softmax_test \
+    -praxis/layers:flaxformer_models_test \
+    -praxis/layers:models_test \
+    -praxis/layers:ngrammer_test \
+    -praxis/layers:normalizations_test \
+    -praxis/layers:transformer_models_test \
+    -praxis/layers:transformers_test
+
 RUN cd praxis && bash praxis/pip_package/build_pip_pkg.sh
 
 WORKDIR /
