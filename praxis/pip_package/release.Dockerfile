@@ -11,7 +11,8 @@ ARG base_image=$cpu_base_image
 
 ENV PYTHON_VERSION="3"
 ENV PYTHON_MINOR_VERSION="8"
-ENV WHEEL_FOLDER
+ARG wheel_folder
+ENV WHEEL_FOLDER $wheel_folder
 RUN mkdir $WHEEL_FOLDER
 # Pick up some TF dependencies
 RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends software-properties-common
