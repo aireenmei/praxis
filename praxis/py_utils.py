@@ -20,7 +20,7 @@ import dataclasses
 import functools
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from absl import flags
 from absl import logging
@@ -94,6 +94,20 @@ def _unzip2(xys):
 jax.tree_util.register_pytree_node(NestedMap,
                                    lambda xs: _unzip2(sorted(xs.items()))[::-1],
                                    lambda keys, xs: NestedMap(zip(keys, xs)))
+
+
+def _nested_map_to_state_dict(xs: NestedMap) -> Dict[str, Any]:
+  return flax.serialization.to_state_dict(dict(xs))
+
+
+def _nested_map_from_state_dict(xs: NestedMap, states: Dict[str,
+                                                            Any]) -> NestedMap:
+  return NestedMap(flax.serialization.from_state_dict(dict(xs), states))
+
+
+flax.serialization.register_serialization_state(NestedMap,
+                                                _nested_map_to_state_dict,
+                                                _nested_map_from_state_dict)
 
 
 @functools.partial(functools.partial, jax.tree_map)
@@ -291,6 +305,22 @@ def sync_global_devices(name: str) -> None:
                name, global_device_count)
 
 
+def put_to_devices(host_array: np.ndarray,
+                   local_devices: Sequence[Any]) -> List[Any]:
+  """Transfers a host array to the local devices."""
+  local_device_count = len(local_devices)
+  try:
+    per_device_arrays = np.split(host_array, local_device_count, axis=0)
+  except ValueError as array_split_error:
+    raise ValueError(
+        f'Unable to put to devices shape {host_array.shape} with '
+        f'local device count {local_device_count}') from array_split_error
+  device_buffers = [
+      jax.device_put(arr, d) for arr, d in zip(per_device_arrays, local_devices)
+  ]
+  return device_buffers
+
+
 # We use Any types to allow nested data structures. They are defined in pytypes
 # which would cause a circular dependency.
 def create_gda(host_arrays: Union[np.ndarray, Any],
@@ -312,20 +342,9 @@ def create_gda(host_arrays: Union[np.ndarray, Any],
   """
 
   local_devices = global_mesh.local_devices
-  local_device_count = jax.local_device_count()
 
   def _put_to_devices(x):
-    try:
-      per_device_arrays = np.split(x, local_device_count, axis=0)
-    except ValueError as array_split_error:
-      raise ValueError(
-          f'Unable to put to devices shape {x.shape} with '
-          f'local device count {local_device_count}') from array_split_error
-    device_buffers = [
-        jax.device_put(arr, d)
-        for arr, d in zip(per_device_arrays, local_devices)
-    ]
-    return device_buffers
+    return put_to_devices(x, local_devices)
 
   device_buffers = jax.tree_map(_put_to_devices, host_arrays)
 
@@ -372,7 +391,15 @@ def convert_fully_replicated_sda_to_gda(sda):
 
 
 def convert_fully_replicated_gda_to_sda(gda):
-  """Convert a fully replicated GDA to SDA."""
+  """Converts a fully replicated GDA to SDA.
+
+  Args:
+    gda: Fully replicated GDA.
+
+  Returns:
+    Fully replicated SDA.
+  """
+  assert isinstance(gda, gda_lib.GlobalDeviceArray)
   with jax.transfer_guard('disallow'):
     local_shape = (jax.local_device_count(),) + gda.shape
     local_aval = jax.core.ShapedArray(local_shape, gda.dtype)
@@ -382,6 +409,29 @@ def convert_fully_replicated_gda_to_sda(gda):
     indices = pxla.spec_to_indices(local_shape, sharding_spec)
     return pxla.make_sharded_device_array(local_aval, sharding_spec,
                                           list(gda._device_buffers), indices)  # pylint: disable=protected-access
+
+
+def convert_fully_replicated_array_to_pmap_array(arr):
+  """Converts a fully replicated Array to Array with PmapSharding.
+
+  Args:
+    arr: Fully replicated jax.Array.
+
+  Returns:
+    Fully replicated jax.Array with PmapSharding. This is suitable as an
+    input to pmap.
+  """
+  assert isinstance(arr, jax.Array)
+  with jax.transfer_guard('disallow'):
+    local_shape = (jax.local_device_count(),) + arr.shape
+    sharded_aval = jax.core.ShapedArray(local_shape[1:], arr.dtype)
+    sharding_spec = pxla._pmap_sharding_spec(  # pylint: disable=protected-access
+        local_shape[0], local_shape[0], 1, None, sharded_aval, 0)
+    device_buffers = arr.device_buffers  # pytype: disable=attribute-error
+    devices = np.array([d.device() for d in device_buffers])
+    s = sharding.PmapSharding(devices, sharding_spec)
+    return jax.make_array_from_single_device_arrays(local_shape, s,
+                                                    device_buffers)
 
 
 def gda_or_jax_array():
@@ -484,8 +534,8 @@ def maybe_pad_uneven_sharding(xs: JTensor,
                                             mesh_axis_names)
     if all([p == 0 for p in paddings]):
       return x
-    # Annotate before pad to make sure they have the same sharding. (Pad does not
-    # have the highest sharding propgation priority.)
+    # Annotate before pad to make sure they have the same sharding.
+    # (Pad does not have the highest sharding propagation priority.)
     x = with_sharding_constraint(x, pspec)
     return jnp.pad(x, [[0, p] for p in paddings])
 

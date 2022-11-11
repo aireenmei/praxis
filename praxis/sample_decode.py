@@ -20,7 +20,7 @@ Greedy decode is a special case for sample decode.
 """
 
 import functools
-from typing import List, Optional, Union
+from typing import List, Sequence, Optional, Union
 
 from flax import linen as nn
 import jax
@@ -362,7 +362,7 @@ def sample_decode(model: base_layer.BaseLayerApi,
 
     # If cf guidance scale is a list floats with length == num_samples, we
     # convert it to the target shape to be used in decode loop_body.
-    if isinstance(cf_guidance_scale, list):
+    if isinstance(cf_guidance_scale, Sequence):
       assert len(cf_guidance_scale) == num_samples
       cf_guidance_scale = jnp.array(cf_guidance_scale)
       cf_guidance_scale = cf_guidance_scale[jnp.newaxis, :, jnp.newaxis]
@@ -387,11 +387,12 @@ def sample_decode(model: base_layer.BaseLayerApi,
     assert max_prefix_len is not None
     # Update loop init states with prefix.
     val.step = max_prefix_len - 1
-    val.segment_pos = jnp.expand_dims(prefix_lengths, 1) - 1
+    val.segment_pos = prefix_lengths - 1
   else:
     output_ids = output_ids.at[:, 0].set(target_prefix_ids[:, 0])
     val.step = 0
-    val.segment_pos = None
+    val.segment_pos = jnp.zeros([batch_size], dtype=jnp.int32)
+
   val.output_ids = output_ids
   # Shape [batch_size], whether each row has terminated and should stop.
   val.done = jnp.zeros(shape=batch_size, dtype=jnp.bool_)
@@ -465,13 +466,12 @@ def sample_decode(model: base_layer.BaseLayerApi,
     if fprop_for_prefix:
       prefix_offset = max_prefix_len
       decode_lengths = prefix_lengths + (step - max_prefix_len + 2)
-      # Updates segment pos when using fprop for prefix.
-      val.segment_pos += 1
     else:
       # if eos is part of prefix, ignore it.
       val.done = jnp.where(step < prefix_lengths - 1, prev_done, val.done)
       prefix_offset = prefix_lengths
       decode_lengths = jnp.ones_like(val.decode_lengths) * (step + 2)
+    val.segment_pos += 1
 
     max_decoding_steps_reached = (jnp.ones_like(prefix_lengths) * (step + 2) -
                                   prefix_offset) >= max_decode_steps
@@ -487,7 +487,6 @@ def sample_decode(model: base_layer.BaseLayerApi,
     val.logprobs = val.logprobs.at[:, step + 1].set(logprobs_at_new_ids)
     val.step += 1
     return val
-
 
   if early_exit:
     result = nn.while_loop(

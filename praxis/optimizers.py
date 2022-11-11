@@ -63,13 +63,12 @@ TransformInitPartitionSpecFn = Callable[[NestedHParams],
 instantiate = base_hyperparams.instantiate
 
 _WEIGHT_DECAY_DEPRECATION_TEMPLATE = (
-    'DEPRECATION WARNING: p.{0} is deprecated. Currently, setting '
-    'p.{0} will have no effect on the optimizer. In the future, '
-    'p.{0} will be removed and setting it will throw an exception. '
-    'Please use p.l2_regularizer_weight for coupled weight decay (i.e., '
-    'weight decays that affect optimizer slots), and use '
-    'p.decoupled_weight_decay for decoupled weight decay (i.e., weight decays '
-    'that are added only to the final update).')
+    'DEPRECATION WARNING: p.{0} will be deprecated. In future, '
+    'we will do a migration to remove p.{0} and after that, setting it will '
+    'throw an exception. In future, we will use p.l2_regularizer_weight for '
+    'coupled weight decay (i.e., weight decays that affect optimizer slots), '
+    'and use p.decoupled_weight_decay for decoupled weight decay (i.e., '
+    'weight decays that are added only to the final update).')
 
 _WEIGHT_DECAY_DEPRECATION = _WEIGHT_DECAY_DEPRECATION_TEMPLATE.format(
     'weight_decay')
@@ -832,8 +831,7 @@ class BaseOptimizer(base_hyperparams.BaseParameterizable):
     clip_gradient_norm_to_value: float = 0.0
     clip_gradient_single_norm_to_value: float = 0.0
     learning_rate: float = 0.0
-    lr_schedule: Optional[
-        schedules.BaseSchedule.HParams] = base_layer.sub_config_field(None)
+    lr_schedule: Optional[schedules.BaseSchedule.HParams] = None
     ema_decay: float = 0.0
 
   def __init__(self, hparams: BaseOptimizer.HParams) -> None:
@@ -2621,6 +2619,10 @@ class ShardedStaticAccumulator(BaseOptimizer):
 
   Note we accumulate the gradients in whatever dtype they are, and then call the
   base optimizer transformation using the mean of the updates.
+
+  When used with ShardedAdafactor turn off per_var_learning_summary since
+  accessing global summary within lax.while_loop won't work. Other summaries
+  should work ok.
   """
 
   class HParams(BaseOptimizer.HParams):
