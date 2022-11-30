@@ -25,7 +25,7 @@ import functools
 import itertools
 import math
 import typing
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, TypeVar, Union, Mapping
 
 from absl import flags
 from absl import logging
@@ -328,26 +328,26 @@ class WeightInit(BaseHyperParams):
   method: str
   scale: float
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Gaussian(scale: float = 1.0):
     """scale * jax.random.normal(0, 1.0)."""
     return WeightInit('gaussian', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Uniform(scale: float = 1.0):
     """scale * jax.random.uniform(-1.0, 1.0)."""
     return WeightInit('uniform', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Xavier(scale: float = 1.0):
     """Xavier initialization (x = sqrt(6. / (in + out)); [-x, x])."""
     return WeightInit('xavier', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def XavierWithFixupParams(scale: float = 1.0,
                             depth: float = 1.0,
                             layers_per_residual_block: float = 1.0):
@@ -355,74 +355,74 @@ class WeightInit(BaseHyperParams):
     scale = scale * math.pow(depth, (-1.0 / (2 * layers_per_residual_block)))
     return WeightInit('xavier', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def Constant(scale: float = 1.0):
     """scale."""
     return WeightInit('constant', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussian(scale: float = 1.0):
     """scale * jax.random.truncated_normal(-2.0, 2.0)."""
     return WeightInit('truncated_gaussian', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtDim(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(dim0))."""
     return WeightInit('gaussian_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanIn(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(fan_in))."""
     return WeightInit('gaussian_sqrt_fanin', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanOut(scale: float = 1.0):
     """scale * jax.random.normal(0, 1 / sqrt(fan_out))."""
     return WeightInit('gaussian_sqrt_fanout', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def GaussianSqrtFanAvg(scale: float = 1.0):
     """jax.random.normal(0, sqrt(2.0 / (in + out)))."""
     return WeightInit('gaussian_sqrt_fanavg', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def UniformSqrtDim(scale: float = 1.0):
     """scale * jax.random.uniform(-1 / sqrt(dim0), 1 / sqrt(dim0))."""
     return WeightInit('uniform_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def UniformUnitScaling(scale: float = 1.0):
     """scale * sqrt(3) / sqrt(dim0) * jax.random.uniform(-1, 1)."""
     return WeightInit('uniform_unit_scaling', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtDim(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(dim0))."""
     return WeightInit('truncated_gaussian_sqrt_dim', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtFanIn(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(fan_in))."""
     return WeightInit('truncated_gaussian_sqrt_fanin', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def TruncatedGaussianSqrtFanOut(scale: float = 1.0):
     """scale * jax.random.truncated_normal(0, 1 / sqrt(fan_out))."""
     return WeightInit('truncated_gaussian_sqrt_fanout', scale)
 
-  @staticmethod
   @pax_fiddle.auto_config
+  @staticmethod
   def ScaledDeltaOrthogonal(scale: float = 1.0):
     return WeightInit('delta_orthogonal', scale)
 
@@ -1055,6 +1055,28 @@ def _maybe_to_bfloat16_dtype(x):
     return jax.ShapeDtypeStruct(x.shape, x.dtype)
 
 
+# BoxedPartitionSpec holds the PartitionSpec in 'meta'.
+@struct.dataclass
+class BoxedPartitionSpec:
+  meta: Any = struct.field(pytree_node=False)
+
+
+def _weight_hparam_to_pspec(hparam, mesh_axis_names) -> BoxedPartitionSpec:
+  """Converts split_dims_mapping weight hparam to BoxedPartitionSpec.
+
+  Args:
+    hparam: the weight hparam to be converted.
+    mesh_axis_names: A tuple/list of strings of the name of the device mesh.
+
+  Returns:
+    A BoxedPartitionSpec.
+  """
+  mapping = hparam.tensor_split_dims_mapping
+  if mapping is None:
+    mapping = [None] * len(hparam.shape)
+  return BoxedPartitionSpec(meta=to_partition_spec(mapping, mesh_axis_names))
+
+
 class BaseLayerApi(nn.Module):
   """Common subclass for `BaseLayer` and `FiddleBaseLayer`.
 
@@ -1167,13 +1189,26 @@ class BaseLayerApi(nn.Module):
     Args:
       *args: used for scan's rigid signature requirements.
     """
+
+    def is_sublayer_template(val):
+      template_types = (base_hyperparams.InstantiableHyperParams,
+                        pax_fiddle.Config)
+      if isinstance(val, template_types) and issubclass(val.cls, BaseLayerApi):
+        return True
+
+      # Check if val is a container of sub-layer templates.
+      if isinstance(val, Mapping) and all(isinstance(key, str) for key in val):
+        return is_sublayer_template(list(val.values()))
+      if isinstance(val, (list, tuple)):
+        if any(is_sublayer_template(child) for child in val):
+          if all(is_sublayer_template(child) or child is None for child in val):
+            return True
+      return False
+
     hparams = self.hparams.clone()
-    for p_name in self._hparam_fields():
+    for p_name in self._hparam_fields:
       p_value = getattr(hparams, p_name)
-      if (isinstance(
-          p_value,
-          (base_hyperparams.InstantiableHyperParams, pax_fiddle.Config)) and
-          issubclass(p_value.cls, BaseLayerApi)):
+      if is_sublayer_template(p_value):
         # No need to include sub-layer template params, since the instantiated
         # sub-layer will show up in its own collection anyways.
         setattr(hparams, p_name, None)
@@ -1192,7 +1227,8 @@ class BaseLayerApi(nn.Module):
       jax.tree_map(force, val)
     return None
 
-  def _hparam_fields(self) -> List[str]:
+  @property
+  def _hparam_fields(self) -> Set[str]:
     """Returns a list of hyperparameter field names for `self`."""
     raise ValueError(f'Abstract method {type(self)}._hparam_fields')
 
@@ -1646,13 +1682,10 @@ class BaseLayerApi(nn.Module):
     Returns:
       The created sub layers, or makes the sub layers an assess of this layer.
     """
+    assert isinstance(params, Sequence)
     uid = itertools.count()
-
-    def _instantiate(p: InstantiableHyperParams) -> BaseLayerT:
-      return self._create_child(f'{name}_{next(uid)}', p)
-
     self._check_child_layername_conflict(name)
-    children = jax.tree_map(_instantiate, params)
+    children = [self._create_child(f'{name}_{next(uid)}', p) for p in params]
     if self._state.in_setup:
       setattr(self, name, children)
     return children
@@ -1683,7 +1716,7 @@ class BaseLayerApi(nn.Module):
   @nn.nowrap
   def _check_child_layername_conflict(self, name: str):
     """Registers child creation with LayerRegistry."""
-    if name in self._hparam_fields():
+    if name in self._hparam_fields:
       raise AttributeError(
           f'{self.__class__}.HParams has a field named {name!r}. We are '
           'disallowing creating children of the same name, since those will '
@@ -1705,6 +1738,22 @@ class BaseLayerApi(nn.Module):
     return jax.tree_util.tree_map(_cast, value)
 
   def quantize_weight(self) -> NestedJTensor:
+    """Quantize the current layer and it's children layer(s).
+
+    Returns:
+      a nested map from names to quantized weights.
+    """
+    return self._quantize_fn(return_pspec=False)
+
+  def quantized_partitioned_specs(self) -> Any:
+    """Get quantization spec for the current layer and it's children layer(s).
+
+    Returns:
+      a nested map from names to partition spec.
+    """
+    return self._quantize_fn(return_pspec=True)
+
+  def _quantize_fn(self, return_pspec: bool) -> Union[NestedJTensor, Any]:
     """quantize_weight() quantize the current layer and it's children layer(s).
 
     Quantization applies to only PARAMS and NON_TRAINABLE collection.
@@ -1715,15 +1764,24 @@ class BaseLayerApi(nn.Module):
        potentially different quantization strategies. They should take care of
        quantization of their children's layers, too.
 
+    Args:
+      return_pspec: a boolean to control if returning ParititionSpecs for
+      quantized tensors.
+          If True, returns the partition specs.
+          If False, returns quantized tensors.
+
     Returns:
-      a nested map between names to quantized layer.
+      a nested map from names to quantized layer or partition spec.
     """
     res = {}
     # collections to quantize.
     targets = [PARAMS, NON_TRAINABLE]
     for name, child in self._private_children.items():
       # example child_res {'params': {a:{}, b:{}}, 'non-trainable':{a:{}}}
-      child_res = child.quantize_weight()
+      if return_pspec:
+        child_res = child.quantized_partitioned_specs()
+      else:
+        child_res = child.quantize_weight()
       for child_target in child_res:
         if child_target not in res:
           res[child_target] = {}
@@ -1736,6 +1794,9 @@ class BaseLayerApi(nn.Module):
           continue
         if target not in res:
           res[target] = {}
+        if return_pspec:
+          var_val = _weight_hparam_to_pspec(self._weight_hparams[var_name],
+                                            self.hparams.mesh_axis_names)
         res[target][var_name] = var_val
     return res
 
@@ -1850,6 +1911,20 @@ class BaseLayer(
         assert len(self.ici_mesh_shape) == len(self.dcn_mesh_shape)
         return [i * d for i, d in zip(self.ici_mesh_shape, self.dcn_mesh_shape)]
 
+    @classmethod
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+      allowed_names = set(cls.__annotations__)
+      allowed_names.update(
+          {'__annotations__', '__module__', '__doc__', '_attribute_overrides'})
+      for name in vars(cls).keys() - allowed_names:
+        raise ValueError(
+            f'Unsupported declaration `{name}` on `{cls}`. Defining non-field '
+            'methods or attributes on HParams objects is disallowed, as they '
+            'will be lost during the Fiddle migration.')
+
+      # Skip registration, since we override it below.
+      super().__init_subclass__(__register_traverser__=False, **kwargs)
+
   @classmethod
   def __init_subclass__(cls, **kwargs: Any) -> None:
     """Automatically initializes all subclasses as custom dataclasses."""
@@ -1873,8 +1948,11 @@ class BaseLayer(
     cls.HParams.__module__ = cls.__module__
     cls.HParams.__qualname__ = f'{cls.__name__}.HParams'
 
-  def _hparam_fields(self) -> List[str]:
-    return [field.name for field in dataclasses.fields(self.hparams)]
+    pax_fiddle._register_traversers_for_subclass(cls.HParams)  # pylint: disable=protected-access
+
+  @functools.cached_property
+  def _hparam_fields(self) -> Set[str]:
+    return set(field.name for field in dataclasses.fields(self.hparams))
 
   def __post_init__(self):
     if self._hparams.name:
@@ -2010,7 +2088,7 @@ class _FiddleHParamsInstanceStub:
       # `copy.copy` bypasses the constructor, so it's possible to have a
       # _FiddleHParamsInstanceStub that doesn't have a _base_layer yet.
       raise AttributeError(f'{self} has no attribute {name!r}')
-    if name not in self._base_layer._hparam_fields() or name == 'parent':
+    if name not in self._base_layer._hparam_fields or name == 'parent':
       raise AttributeError(
           f'{type(self._base_layer)}.HParams has no attribute {name!r}')
     value = getattr(self._base_layer, name)
@@ -2086,7 +2164,6 @@ class FiddleBaseLayer(BaseLayerApi):
     """
     out: SplitDimsMapping = None
 
-
   # The following configuration fields correspond 1:1 with BaseLayer.HParams.
   dtype: jnp.dtype = jnp.float32
   fprop_dtype: Optional[Any] = None
@@ -2135,15 +2212,16 @@ class FiddleBaseLayer(BaseLayerApi):
   # * `self.hparams` returns a Fiddle Config that can be used to build self.
   # * `self.HParams` returns a stub class that can be called to generate a
   #   `fdl.Config`; or can be used with `base_hyperparams.sub_config_field`.
-  hparams = property(_FiddleHParamsInstanceStub)
+  hparams = functools.cached_property(_FiddleHParamsInstanceStub)
   HParams = _FiddleHParamsClassStubDescriptor()  # pylint: disable=invalid-name
 
   @classmethod
   def config(cls, **kwargs) -> pax_fiddle.Config:
     return pax_fiddle.Config(cls, **kwargs)
 
-  def _hparam_fields(self) -> List[str]:
-    return [field.name for field in dataclasses.fields(self) if field.init]
+  @functools.cached_property
+  def _hparam_fields(self) -> Set[str]:
+    return set(field.name for field in dataclasses.fields(self) if field.init)
 
   @classmethod
   def __init_subclass__(cls, **kwargs: Any):
@@ -2279,28 +2357,59 @@ class _WrapperLayer(BaseLayer):
 
 
 @enum.unique
+class QuantizationType(str, enum.Enum):
+  """The different types for quantization.
+
+  PTQ indicates Post Training Quantization.
+  AQT indicates Accurate Quantized Training, which is one flavor of QAT.
+  FQ  indicates Fake Quantization, which is one flavor of QAT.
+  """
+
+  PTQ = 'ptq'
+  AQT = 'aqt'
+  FQ = 'fq'
+
+
+@enum.unique
+class ActivationQuantizationType(str, enum.Enum):
+  """The different types for activation quantization.
+
+  NONE indicates no quantization on the activation.
+  DYNAMIC indicates dynamic quantization on the activation.
+  STATIC indicates static quantization on the activation.
+  """
+  NONE = 'none'
+  DYNAMIC = 'dynamic'
+  STATIC = 'static'
+
+
+@enum.unique
 class QuantizationMode(str, enum.Enum):
   """The different modes for quantization.
 
-  INFERENCE indicates that the model is already quantized and is ready to run
-    inference with the previously set dtypes.
-  QUANTIZE indicates that the model is still float and is going to be quantized
-    according to the provided dtypes.
+  TRAINING indicates that the model is in the training mode.
+  MATERIALIZE indicates that the model weights are being materialized as
+    quantized weights and scales. After materialization mode is set to
+    inference.
+  INFERENCE indicates that the model is in inference mode.
   """
+  TRAINING = 'training'
+  MATERIALIZE = 'materialize'
   INFERENCE = 'inference'
-  QUANTIZE = 'quantize'
 
 
 class QuantizationHParams(base_hyperparams.BaseHyperParams):
   """Parameters for quantization.
 
-  Currently supports only post-training quantization.
-
   Attributes:
+    quantization_type: quantization type.
     mode: the quantization mode associated with this quantization parameter.
+    activation_quantization_type: quantization type for activation.
   """
 
+  quantization_type: QuantizationType = QuantizationType.PTQ
   mode: QuantizationMode = QuantizationMode.INFERENCE
+  activation_quantization_type: ActivationQuantizationType = ActivationQuantizationType.NONE
 
 
 def get_template_fields(

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from flax.core import frozen_dict
 import copy
 import dataclasses
 import enum
@@ -145,7 +146,7 @@ def visit_nested_struct(obj_to_visit: Any,
         exit_fn(key, val)
       else:
         visit_fn(key, val)
-    elif isinstance(val, dict):
+    elif isinstance(val, (dict, frozen_dict.FrozenDict)):
       if enter_fn(key, val):
         for k, v in val.items():
           _visit(_sub_key(key, k), v)
@@ -231,7 +232,7 @@ def nested_struct_to_text(obj_to_visit: Any,
     """Get the representation of `val`."""
     if isinstance(val, HParams):
       return _SortedDict({k: get_repr(v) for k, v in val.IterParams()})
-    if isinstance(val, dict):
+    if isinstance(val, (dict, frozen_dict.FrozenDict)):
       return _SortedDict({k: get_repr(v) for k, v in val.items()})
     if isinstance(val, np.ndarray):
       return np.array2string(val, separator=', ')
@@ -277,12 +278,15 @@ def nested_struct_to_text(obj_to_visit: Any,
     elif (isinstance(val, (list, tuple)) and
           all(isinstance(x, BaseHyperParams) for x in val)):
       return True
+    elif (isinstance(val, (list, tuple)) and
+          all(isinstance(x, fdl.Buildable) for x in val)):
+      return True
     # Internal handle of config_dict.ConfigDict sequence in nested_struct_to_text
     # TODO(jiahuiyu): Create single-direction DebugString for
     # List[(str, HParams)] pattern and remove redundancies.
     elif _is_str_param_pairs(val):
       return True
-    elif isinstance(val, dict):
+    elif isinstance(val, (dict, frozen_dict.FrozenDict)):
       return True
     elif isinstance(val, fdl.Buildable):
       return True
@@ -378,7 +382,10 @@ class BaseHyperParams:
     return fdl.cast(fdl.Partial, cls.config(**kwargs))
 
   @classmethod
-  def __init_subclass__(cls, **kwargs: Any) -> None:
+  def __init_subclass__(cls,
+                        *,
+                        __register_traverser__=True,
+                        **kwargs: Any) -> None:
     """Verifies properties about subclasses.
 
     Properties verified:
@@ -386,6 +393,8 @@ class BaseHyperParams:
       `_attribute_overrides` (which is always allowed to be redeclared).
 
     Args:
+      __register_traverser__: Internal argument signaling whether to register
+        a node traverser.
       **kwargs: Arguments passed to the corresponding base method.
     """
     super().__init_subclass__(**kwargs)
@@ -419,6 +428,9 @@ class BaseHyperParams:
         raise AttributeError(f'Attribute {key} was overridden while it is not '
                              f'explicitly listed in the _attribute_overrides '
                              f'list.')
+
+    if __register_traverser__:
+      pax_fiddle._register_traversers_for_subclass(cls)  # pylint: disable=protected-access
 
   def _check_assignment(self, field: dataclasses.Field[Any],
                         value: Any) -> None:
@@ -630,6 +642,9 @@ def sub_config_field(
     lazy_ref: Optional[Callable[[], Type[BaseHyperParams]]] = None,
 ):
   """Returns an instance of the sub-config factory.
+
+  By supplying a factory method to the datacalsses.field, this function avoids
+  multiple sub_config_cls instances referencing the same mutable default value.
 
   Args:
     sub_config_cls: A reference to a sub-configuration class, e.g.

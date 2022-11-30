@@ -185,6 +185,13 @@ class LanguageModel(base_model.BaseModel):
     lm_p.model_type = p.model_type
     self.create_child('lm', lm_p)
 
+    if template_has_type(p.decoder_tpl, SampleDecoderHParams):
+      next_token_sampler_p = p.decoder_tpl.next_token_sampler_tpl.clone()
+      # TODO(b/260646361): Avoid this param propagation.
+      next_token_sampler_p.top_k = p.decoder_tpl.k
+      next_token_sampler_p.top_p = p.decoder_tpl.p
+      self.next_token_sampler = base_layer.instantiate(next_token_sampler_p)
+
   def _prepare_predict_data(self, input_batch: NestedMap) -> NestedMap:
     p = self.hparams
     paddings = input_batch.paddings
@@ -471,12 +478,11 @@ class LanguageModel(base_model.BaseModel):
           transform_decode_state_fn,
           lazy_broadcast_prefix_fn
           if p.decoder_tpl.lazy_prefix_broadcast else None,
+          self.next_token_sampler,
           decode_data.input_ids,
           decode_data.input_paddings,
           decode_data.seqlen,
           num_samples=p.decoder_tpl.num_samples,
-          k=p.decoder_tpl.k,
-          p=p.decoder_tpl.p,
           fprop_for_prefix=p.decoder_tpl.fprop_for_prefix,
           temperature=temperature,
           max_prefix_len=max_prefix_len,
@@ -571,13 +577,7 @@ class LanguageModel(base_model.BaseModel):
           decoded_ids[None, :],
           np.array([decode_length - prefix_length], dtype=np.int32))[0]
 
-      ex = jax.tree_map(lambda x: x[idx], decode_out)  # pylint: disable=cell-var-from-loop
-      key = py_utils.get_enumeration_id(ex)
-      if not key:
-        # not using seqio input's use_enumeration matching
-        key = prefix_strs[idx]
-
-      ret.append((key, {
+      ret.append((prefix_strs[idx], {
           'prefix': prefix_strs[idx],
           'decoded': decoded_str,
           'original': original_strs[idx],
@@ -797,16 +797,10 @@ class SequenceModel(base_model.BaseModel):
           not decode_out.eval_sample_weights[idx]):
         continue
 
-      ex = jax.tree_map(lambda x: x[idx], decode_out)  # pylint: disable=cell-var-from-loop
-      key = py_utils.get_enumeration_id(ex)
-      if not key:
-        # not using seqio input's use_enumeration matching
-        key = source_strs[idx]
-
       logging.info('SRC: %s\n', source_strs[idx])
       logging.info('TGT: %s\n', target_strs[idx])
       logging.info('OUT: %s\n', decoded_str)
-      ret.append((key, {
+      ret.append((source_strs[idx], {
           'source': source_strs[idx],
           'decoded': decoded_str,
           'target': target_strs[idx],
@@ -1088,14 +1082,17 @@ class ClassificationMLPModel(base_model.BaseModel):
   def setup(self) -> None:
     super().setup()
     p = self.hparams
-    self.create_children('mlp_layers', p.mlp_tpl.clone())
-    self.create_child('softmax', p.softmax_tpl.clone())
+    # Note: We add a `_0` suffix here because this child was previously created
+    # using create_children; and we want to ensure that its name stays the
+    # same (for checkpoints, etc).
+    self.create_child('mlp_layers_0', p.mlp_tpl)
+    self.create_child('softmax', p.softmax_tpl)
 
   def compute_predictions(self, input_batch: NestedMap) -> Predictions:
 
     input_emb = self.softmax.emb_lookup(input_batch.ids)
 
-    output = self.mlp_layers(input_emb)
+    output = self.mlp_layers_0(input_emb)
     predictions = self.softmax(
         inputs=output,
         class_weights=input_batch.weights[:, :, jnp.newaxis],

@@ -47,7 +47,7 @@ WeightedScalars = pytypes.WeightedScalars
 BaseHParams = base_layer.BaseLayer.HParams
 sub_config_field = base_layer.sub_config_field
 LogicalAxisRules = pytypes.LogicalAxisRules
-DecodeOut = Tuple[WeightedScalars, NestedMap, Any]
+DecodeOut = base_model.DecodeOut
 PyTreeDef = type(jax.tree_util.tree_structure(None))
 SampleDecoderHParams = decoder_hparams.SampleDecoderHParams
 DecoderHParams = decoder_hparams.DecoderHParams
@@ -605,6 +605,7 @@ class LanguageModel(base_model.BaseModel):
       - metrics, a NestedMap containing str keys and clu_metrics.Metric
         objects. This is currently optional.
     """
+    assert isinstance(self.hparams.decoder_tpl, SampleDecoderHParams)
     num_decodes = self.hparams.decoder_tpl.num_samples
     params = self.decoder.variables['params']
     decoder_params = {'eos_id': self.hparams.decoder_tpl.eos_id}
@@ -697,7 +698,7 @@ class LanguageModel(base_model.BaseModel):
                                                  (batch_size, num_decodes)),
                       decode_lengths=jnp.reshape(decode_lengths,
                                                  (batch_size, num_decodes)),
-                  ), None)
+                  ), NestedMap())
     return decode_out
 
   def _compute_logits_from_slice(
@@ -928,7 +929,7 @@ class EncoderDecoderModel(base_model.BaseModel):
         NestedMap(num_decoded=(num_decodes, jnp.array(1, jnp.float32))),
         NestedMap(output_ids=decodes[:, -1, :],
                   logprobs=scores[:, -1]),
-        None)
+        NestedMap())
     # pyformat: enable
     return decode_out
 

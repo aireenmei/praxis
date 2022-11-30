@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
+from jax.experimental import pjit
 import numpy as np
 from praxis import base_layer
 from praxis import test_utils
@@ -39,7 +40,7 @@ class QuantizedAttentionTest(test_utils.TestCase):
 
   @parameterized.named_parameters(
       ('inference', base_layer.QuantizationMode.INFERENCE),
-      ('quantize', base_layer.QuantizationMode.QUANTIZE),
+      ('quantize', base_layer.QuantizationMode.MATERIALIZE),
   )
   def test_linear_quantized(self, mode):
     p = qlinears.Linear.HParams(
@@ -55,13 +56,16 @@ class QuantizedAttentionTest(test_utils.TestCase):
     self.assertEqual(outputs.shape, (2, 4))
     if mode == base_layer.QuantizationMode.INFERENCE:
       self.assertAllClose(jnp.full((2, 4), 0.0), outputs)
+    else:
+      self.assertRaises(AssertionError, self.assertAllClose,
+                        jnp.full((2, 4), 0.0, dtype=jnp.bfloat16), outputs)
 
 
 class QuantizedLinearsSyncTest(test_utils.TestCase):
   """Sync tests between quantized Linear and regular Linear.
 
   Quantized Linear is expected to be identical to regular linear when
-  running with mode = QUANTIZE.
+  running with mode = MATERIALIZE.
   """
 
   def setUp(self):
@@ -83,7 +87,7 @@ class QuantizedLinearsSyncTest(test_utils.TestCase):
     p_q = qlinears.Linear.HParams(
         name='_linear_q',
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     for p in [p_f, p_q]:
       p.input_dims = 16
       p.output_dims = 24
@@ -99,20 +103,32 @@ class QuantizeLinearTest(test_utils.TestCase):
     super().setUp()
     np.random.seed(123456)
 
-  def test_quantize_linear(self):
+  @parameterized.named_parameters(
+      ('PTQ', base_layer.QuantizationType.PTQ),
+      ('FQ', base_layer.QuantizationType.FQ),
+      ('AQT', base_layer.QuantizationType.AQT),
+  )
+  def test_quantize_linear(self, quantization_type):
     p = qlinears.Linear.HParams(
         name='_linear_q',
+        mesh_axis_names=['replica', 'mdl', 'data'],
+        weight_split_dims_mapping=base_layer.BaseLayer.WeightShardingHParams(
+            wt=['mdl', 'data']),
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            quantization_type=quantization_type,
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     p.input_dims = 6
     p.output_dims = 4
     layer = instantiate(p)
 
     inputs = np.random.normal(1.5, 2.0, [5, 6]).astype(np.float32)
-    prng_key = jax.random.PRNGKey(seed=123)
-    initial_vars = layer.init(prng_key, inputs)
 
-    res, _ = layer.apply(initial_vars, mutable=[], method=layer.quantize_weight)
+    with base_layer.JaxContext.new_context():
+      prng_key = jax.random.PRNGKey(seed=123)
+      initial_vars = layer.init(prng_key, inputs)
+
+      res, _ = layer.apply(
+          initial_vars, mutable=[], method=layer.quantize_weight)
     shapes = jax.tree_map(lambda x: x.shape, res)
     types = jax.tree_map(lambda x: x.dtype, res)
     self.assertEqual(
@@ -126,6 +142,20 @@ class QuantizeLinearTest(test_utils.TestCase):
             'w': jnp.int8,
             'w_quantized_scale': jnp.bfloat16
         }})
+
+    # Check ParititionSpecs.
+    pspec, _ = layer.apply(
+        initial_vars, mutable=[], method=layer.quantized_partitioned_specs)
+    exepected_pspec = {
+        'params': {
+            'w':
+                base_layer.BoxedPartitionSpec(
+                    meta=pjit.PartitionSpec('mdl', 'data')),
+            'w_quantized_scale':
+                base_layer.BoxedPartitionSpec(meta=pjit.PartitionSpec('data'))
+        }
+    }
+    self.assertEqual(pspec, exepected_pspec)
 
 
 if __name__ == '__main__':

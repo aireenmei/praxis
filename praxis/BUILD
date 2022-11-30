@@ -44,6 +44,7 @@ pytype_strict_library(
         # Implicit python proto dependency.
         # Implicit absl.logging dependency.
         # Implicit fiddle dependency.
+        # Implicit flax.core dependency.
         # Implicit ml_collections config_dict dependency.
         # Implicit numpy dependency.
         # Implicit tensorflow_no_contrib dependency.
@@ -119,7 +120,9 @@ pytype_strict_library(
     srcs_version = "PY3",
     deps = [
         ":base_hyperparams",
+        ":base_layer",
         ":pytypes",
+        ":sample_decode",
     ],
 )
 
@@ -266,7 +269,7 @@ pytype_strict_library(
     srcs = ["sample_decode.py"],
     srcs_version = "PY3",
     deps = [
-        ":asserts",
+        ":base_hyperparams",
         ":base_layer",
         ":decoder_utils",
         ":py_utils",
@@ -377,7 +380,11 @@ py_strict_test(
         ":pax_fiddle",
         # Implicit absl.testing.absltest dependency.
         # Implicit fiddle dependency.
+        # Implicit flax.core dependency.
+        # Implicit jax dependency.
         # Implicit ml_collections config_dict dependency.
+        # Implicit numpy dependency.
+        # Implicit tensorflow_no_contrib dependency.
     ],
 )
 
@@ -568,6 +575,7 @@ py_strict_test(
         # Implicit absl.testing.absltest dependency.
         # Implicit absl.testing.parameterized dependency.
         # Implicit fiddle dependency.
+        # Implicit fiddle.daglish dependency.
         # Implicit fiddle.testing dependency.
         # Implicit flax.core dependency.
         # Implicit jax dependency.

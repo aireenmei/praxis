@@ -600,13 +600,22 @@ class AttentionProjection(base_layer.BaseLayer):
 
     if p.attention_combine_dims and has_sharding:
       if len(wp.wt) == 3:
-        h_sharding = ()
-        for axes in (wp.wt[0], wp.wt[1]):
-          if isinstance(axes, (str, int)):
-            h_sharding += (axes,)
-          elif axes is not None:
-            h_sharding += axes
-        wt = [h_sharding, wp.wt[2]]
+        if p.is_output_projection and p.use_nhd_shape:
+          h_sharding = ()
+          for axes in (wp.wt[0], wp.wt[1]):
+            if isinstance(axes, (str, int)):
+              h_sharding += (axes,)
+            elif axes is not None:
+              h_sharding += axes
+          wt = [h_sharding, wp.wt[2]]
+        else:
+          h_sharding = ()
+          for axes in (wp.wt[1], wp.wt[2]):
+            if isinstance(axes, (str, int)):
+              h_sharding += (axes,)
+            elif axes is not None:
+              h_sharding += axes
+          wt = [wp.wt[0], h_sharding]
       assert len(wt) == 2
     else:
       wt = wp.wt
@@ -1220,11 +1229,7 @@ class DotProductAttention(base_layer.BaseLayer):
     # [1, 1, T, S]
     base_layer.assert_has_shape(atten_mask, [-1, 1, -1, s])
     assert atten_mask.shape[2] in [1, t]
-
-    # The following assertion is disabled for jax2tf compatibility.  In the
-    # future it might make sense to support assertions that can be disabled
-    # when running jax2tf.
-    # assert atten_mask.shape[0] in [1, b]
+    assert atten_mask.shape[0] in [b, 1]
 
     query = self._scale_query(query)
     logits = self._atten_logits(query, key)
@@ -1299,7 +1304,7 @@ class DotProductAttention(base_layer.BaseLayer):
             f'q batch size {q_b} is not divisible by state batch size {k_b}')
       key = jnp.repeat(key, q_b // k_b, axis=0)
       value = jnp.repeat(value, q_b // k_b, axis=0)
-    if atten_mask.shape[0] != 1 and atten_mask.shape[0] != q_b:
+    if atten_mask.shape[0] != q_b and atten_mask.shape[0] != 1:
       assert atten_mask.shape[0] == k_b, (atten_mask.shape, k_b)
       atten_mask = jnp.repeat(atten_mask, q_b // k_b, axis=0)
     # query is 3d.
@@ -1309,12 +1314,12 @@ class DotProductAttention(base_layer.BaseLayer):
     base_layer.assert_has_shape(value, [b, s, n, h])
     base_layer.assert_has_shape(query, [b, n, h])
     base_layer.assert_has_shape(atten_mask, [-1, 1, s])
-    assert atten_mask.shape[0] in [1, b]
+    assert atten_mask.shape[0] in [b, 1]
     query = self._scale_query(query)
     logits = jnp.einsum('BNH,BSNH->BNS', query, key)
     if relative_bias is not None:
       base_layer.assert_has_shape(relative_bias, [-1, n, 1, s])
-      assert relative_bias.shape[0] in [1, b]
+      assert relative_bias.shape[0] in [b, 1]
       relative_bias = jnp.squeeze(relative_bias, axis=2)
       logits += relative_bias
     logits = self._cap_logits(logits)
@@ -2047,7 +2052,7 @@ class DotProductAttentionWithLPB(DotProductAttention):
       else:
         base_layer.assert_has_shape(q, [b, -1, n, h])
         base_layer.assert_has_shape(am, [-1, 1, -1, s])
-      assert am.shape[0] in [1, b]
+      assert am.shape[0] in [b, 1]
 
       q = self._scale_query(q)
       if extend_one_step:
@@ -2056,7 +2061,7 @@ class DotProductAttentionWithLPB(DotProductAttention):
         logits = jnp.einsum('BTNH,BSNH->BNTS', q, k)
       if rb is not None:
         base_layer.assert_has_shape(rb, [-1, n, -1, s])
-        assert rb.shape[0] in [1, b]
+        assert rb.shape[0] in [b, 1]
         if rb.shape[2] == 1:
           rb = jnp.squeeze(rb, axis=2)
         logits += rb
@@ -2455,14 +2460,14 @@ class DotProductAttentionXL(DotProductAttention):
 
   def _atten_logits_one_step(self, query, key, step):
     t = step + 1
-    key = key[:, :t]
+    s = key.shape[1]
 
-    # [1, T - 1]
-    pos = jnp.expand_dims(jnp.arange(0, t), 0)
+    # [1, S]
+    pos = jnp.expand_dims(jnp.arange(t - 1, t - s - 1, -1), 0)
     sin_emb = self.pos_emb(position=pos)
-    # [1, T - 1, N, H]
+    # [1, S, N, H]
     sin_emb = self.pos_proj(sin_emb)
-    # [T - 1, N, H]
+    # [S, N, H]
     sin_emb = jnp.squeeze(sin_emb, 0)
 
     # [B, N, T, S=T]
@@ -2502,6 +2507,7 @@ class DotProductAttentionXL(DotProductAttention):
     p = self.hparams
     key = self._shard_blnh(self.get_decode_state(key_state_name))
     value = self._shard_blnh(self.get_decode_state(value_state_name))
+
     k_b = key.shape[0]
     q_b = query.shape[0]
     if q_b != k_b:
@@ -2520,12 +2526,12 @@ class DotProductAttentionXL(DotProductAttention):
     base_layer.assert_has_shape(value, [b, s, n, h])
     base_layer.assert_has_shape(query, [b, n, h])
     base_layer.assert_has_shape(atten_mask, [-1, 1, s])
-    assert atten_mask.shape[0] in [1, b]
+    assert atten_mask.shape[0] in [b, 1]
     query = self._scale_query(query)
     logits = self._atten_logits_one_step(query, key, time_step)
     if relative_bias is not None:
       base_layer.assert_has_shape(relative_bias, [-1, n, 1, s])
-      assert relative_bias.shape[0] in [1, b]
+      assert relative_bias.shape[0] in [b, 1]
       relative_bias = jnp.squeeze(relative_bias, axis=2)
       logits += relative_bias
     logits = self._cap_logits(logits)
@@ -2548,12 +2554,6 @@ class DotProductAttentionXL(DotProductAttention):
                   target_max_length: int) -> NestedMap:
 
     raise NotImplementedError('init_states is not implemented for %s' %
-                              self.__name__)
-
-  def extend_step(self, cached_states: NestedMap, query_vec: JTensor, *,
-                  atten_mask: JTensor,
-                  time_step: JTensor) -> Tuple[JTensor, NestedMap]:
-    raise NotImplementedError('extend_step is not implemented for %s' %
                               self.__name__)
 
 
@@ -2686,7 +2686,7 @@ class LocalSelfAttention(DotProductAttention):
     # [1, 1, T, S]
     base_layer.assert_has_shape(atten_mask, [-1, 1, -1, s])
     assert atten_mask.shape[2] in [1, t]
-    assert atten_mask.shape[0] in [1, b]
+    assert atten_mask.shape[0] in [b, 1]
     query = self._scale_query(query)
 
     # -> [B, U, C, N, H]
@@ -2801,9 +2801,12 @@ class LocalSelfAttention(DotProductAttention):
     raise NotImplementedError('init_states is not implemented for %s' %
                               self.__name__)
 
-  def extend_step(self, cached_states: NestedMap, query_vec: JTensor, *,
+  def extend_step(self, query_vec: JTensor,
+                  *,
                   atten_mask: JTensor,
-                  time_step: JTensor) -> Tuple[JTensor, NestedMap]:
+                  time_step: JTensor,
+                  segment_pos: Optional[JTensor],
+                  is_cross_attention: bool = False) -> JTensor:
     raise NotImplementedError('extend_step is not implemented for %s' %
                               self.__name__)
 

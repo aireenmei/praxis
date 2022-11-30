@@ -16,7 +16,7 @@
 """Quantized Attention Layers."""
 
 import string
-from typing import Tuple
+from typing import Tuple, Any, Sequence
 
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -153,26 +153,61 @@ class AttentionProjection(attentions.AttentionProjection):
 
     if p.quantization.mode == base_layer.QuantizationMode.INFERENCE:
       w, s = self.get_quantized_weight('w')
-      ret = operations.einsum(eqn, inputs, w, s)
+      if p.quantization.quantization_type == base_layer.QuantizationType.PTQ:
+        ret = operations.einsum(eqn, inputs, w, s)
+      elif p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+        raise NotImplementedError('AQT is not yet implemented')
     else:
+      if p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+        raise NotImplementedError('AQT is not yet implemented')
       ret = jnp.einsum(eqn, inputs, w)
     if p.use_bias:
       ret += theta.b
     return ret
 
-  def quantize_weight(self) -> NestedJTensor:
+  def quantized_partitioned_specs(self) -> Any:
+    """Get quantized PartitionSpec.
+
+    Returns:
+      a map from names to partition spec.
+    """
     p = self.hparams
-    assert p.quantization.mode == base_layer.QuantizationMode.QUANTIZE
-    eqn = ''
-    # This matches the equantion logic in __call__ for weights.
+    scale_name = 'w' + base_layer.QUANTIZED_NAME_POSTFIX
+    weight_pspec = base_layer._weight_hparam_to_pspec(
+        self._weight_hparams['w'], self.hparams.mesh_axis_names)
+    wp = p.weight_split_dims_mapping
     if p.is_output_projection:
-      if p.use_nhd_shape:
-        eqn = 'ANH,NHD->AD'
-      else:
-        eqn = 'ANH,DNH->AD'
+      scale_split_dims_mapping = [wp.wt[0]]
     else:
-      eqn = 'AD,DNH->ANH'
-    q_w, q_s = operations.reduce_einsum_weight_precision(eqn, self.theta.w)
+      scale_split_dims_mapping = [wp.wt[1], wp.wt[2]]
+    # scale_weight_hparam is unmaterialized so shape is irrelevant.
+    scale_weight_hparam = WeightHParams(
+        shape=(), tensor_split_dims_mapping=scale_split_dims_mapping)
+    scale_pspec = base_layer._weight_hparam_to_pspec(
+        scale_weight_hparam, self.hparams.mesh_axis_names)
+    partitionspec = {'w': weight_pspec, scale_name: scale_pspec}
+    return {base_layer.PARAMS: partitionspec}
+
+  def quantize_weight(self) -> NestedJTensor:
+    """Get quantized weight.
+
+    Returns:
+      a map from names to quantized weights.
+    """
+    p = self.hparams
+    if p.quantization.quantization_type == base_layer.QuantizationType.PTQ:
+      eqn = ''
+      # This matches the equantion logic in __call__ for weights.
+      if p.is_output_projection:
+        if p.use_nhd_shape:
+          eqn = 'ANH,NHD->AD'
+        else:
+          eqn = 'ANH,DNH->AD'
+      else:
+        eqn = 'AD,DNH->ANH'
+      q_w, q_s = operations.reduce_einsum_weight_precision(eqn, self.theta.w)
+    elif p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+      raise NotImplementedError('AQT quantization is not added yet')
     scale_name = 'w' + base_layer.QUANTIZED_NAME_POSTFIX
     return {base_layer.PARAMS: {'w': q_w, scale_name: q_s}}
 
@@ -199,7 +234,7 @@ class CombinedQKVProjectionLayer(attentions.CombinedQKVProjectionLayer):
     if p.mesh_shape is not None:
       assert wp.wt is not None, ('Must provide sharding annotations for the '
                                  'weights if mesh shape is provided')
-      if (p.attention_combine_dims and isinstance(wp.wt, list) and
+      if (p.attention_combine_dims and isinstance(wp.wt, Sequence) and
           len(wp.wt) == 3):
         wt = [axis for axis in wp.wt if axis is not None]
         assert len(wt) == 2, ('wp.wt only specifies the sharding for '
@@ -287,8 +322,13 @@ class CombinedQKVProjectionLayer(attentions.CombinedQKVProjectionLayer):
     eqn = f'{batch_eqn}D,KDNH->K{batch_eqn}NH'
     if p.quantization.mode == base_layer.QuantizationMode.INFERENCE:
       w, s = self.get_quantized_weight('w')
-      ret = operations.einsum(eqn, inputs, w, s)
+      if p.quantization.quantization_type == base_layer.QuantizationType.PTQ:
+        ret = operations.einsum(eqn, inputs, w, s)
+      elif p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+        raise NotImplementedError('AQT is not yet implemented')
     else:
+      if p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+        raise NotImplementedError('AQT is not yet implemented')
       ret = jnp.einsum(eqn, inputs, w)
     ret = checkpoint_name(ret, 'combined_qkv_proj')
     if p.use_bias:
@@ -302,11 +342,41 @@ class CombinedQKVProjectionLayer(attentions.CombinedQKVProjectionLayer):
     value_proj = checkpoint_name(value_proj, 'value_proj')
     return query_proj, key_proj, value_proj
 
+  def quantized_partitioned_specs(self) -> Any:
+    """Get quantized PartitionSpec.
+
+    Returns:
+      a map from names to partition spec.
+    """
+    p = self.hparams
+    scale_name = 'w' + base_layer.QUANTIZED_NAME_POSTFIX
+    weight_pspec = base_layer._weight_hparam_to_pspec(
+        self._weight_hparams['w'], self.hparams.mesh_axis_names)
+    wp = p.weight_split_dims_mapping
+    if p.attention_combine_dims:
+      scale_split_dims_mapping = [None, wp.wt[1]]
+    else:
+      scale_split_dims_mapping = [None, wp.wt[1], wp.wt[2]]
+    # scale_weight_hparam is unmaterialized so shape is irrelevant.
+    scale_weight_hparam = WeightHParams(
+        shape=(), tensor_split_dims_mapping=scale_split_dims_mapping)
+    scale_pspec = base_layer._weight_hparam_to_pspec(
+        scale_weight_hparam, self.hparams.mesh_axis_names)
+    partitionspec = {'w': weight_pspec, scale_name: scale_pspec}
+    return {base_layer.PARAMS: partitionspec}
+
   def quantize_weight(self) -> NestedJTensor:
+    """Get quantized weight.
+
+    Returns:
+      a map from names to quantized weights.
+    """
     theta = self.theta
     p = self.hparams
-    assert p.quantization.mode == base_layer.QuantizationMode.QUANTIZE
-    eqn = 'AD,KDNH->KANH'
-    q_w, q_s = operations.reduce_einsum_weight_precision(eqn, theta.w)
+    if p.quantization.quantization_type == base_layer.QuantizationType.PTQ:
+      eqn = 'AD,KDNH->KANH'
+      q_w, q_s = operations.reduce_einsum_weight_precision(eqn, theta.w)
+    elif p.quantization.quantization_type == base_layer.QuantizationType.AQT:
+      raise NotImplementedError('AQT quantization is not added yet')
     scale_name = 'w' + base_layer.QUANTIZED_NAME_POSTFIX
     return {base_layer.PARAMS: {'w': q_w, scale_name: q_s}}

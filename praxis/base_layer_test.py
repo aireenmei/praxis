@@ -192,6 +192,9 @@ class BaseLayerTest(test_utils.TestCase):
     init_vars = layer.init(jax.random.PRNGKey(0), x)
     res, _ = layer.apply(init_vars, mutable=[], method=layer.quantize_weight)
     self.assertEqual(res, {})
+    pspec, _ = layer.apply(
+        init_vars, mutable=[], method=layer.quantized_partitioned_specs)
+    self.assertEqual(pspec, {})
 
   @parameterized.parameters((0, 2), (3, 0), (1, 4))
   def test_layer_building_nn_compact(self, num_child: int, num_children: int):
@@ -280,6 +283,8 @@ class BaseLayerTest(test_utils.TestCase):
 
           child_tpl: child_cls.HParams = base_layer.sub_config_field(
               child_cls.HParams)
+          child_tpl_list: Any = base_layer.sub_config_field(None)
+          child_tpl_dict: Any = base_layer.sub_config_field(None)
 
         def setup(self):
           child_tpl = self.hparams.child_tpl.clone()
@@ -292,6 +297,8 @@ class BaseLayerTest(test_utils.TestCase):
       class FiddleParent(base_layer.FiddleBaseLayer):
 
         child_tpl: Any = base_layer.sub_config_field(child_cls.HParams)
+        child_tpl_list: Any = base_layer.sub_config_field(None)
+        child_tpl_dict: Any = base_layer.sub_config_field(None)
 
         def setup(self):
           child_tpl = self.child_tpl.clone()
@@ -306,6 +313,8 @@ class BaseLayerTest(test_utils.TestCase):
         with self.subTest(f'{parent_cls.__name__}_{child_cls.__name__}'):
           p = parent_cls.HParams(name='test')
           p.child_tpl = child_cls.HParams(x=5)
+          p.child_tpl_list = [child_cls.HParams(x=7), child_cls.HParams(x=12)]
+          p.child_tpl_dict = {'x': child_cls.HParams(x=12)}
           layer = p.Instantiate()
 
           model = layer.bind(
@@ -321,6 +330,8 @@ class BaseLayerTest(test_utils.TestCase):
           self.assertEqual(hyper_params['child']['_hparams'].dtype, jnp.float32)
           self.assertEqual(hyper_params['child']['_hparams'].x, 7)
           self.assertIsNone(hyper_params['_hparams'].child_tpl)
+          self.assertIsNone(hyper_params['_hparams'].child_tpl_list)
+          self.assertIsNone(hyper_params['_hparams'].child_tpl_dict)
 
   @parameterized.parameters([
       # Hparams compared w/ HParams
@@ -380,6 +391,48 @@ class BaseLayerTest(test_utils.TestCase):
       prms = mod.init({'params': key}, jnp.ones((3, 3)))
       self.assertIn('x', prms['params'])
 
+  def test_hparam_methods_are_disallowed(self):
+
+    expected_msg = 'Unsupported declaration `some_method` on `<class '
+    with self.assertRaisesRegex(ValueError, expected_msg):
+
+      class Layer(base_layer.BaseLayer):  # pylint: disable=unused-variable
+        """Test layer, inheriting from BaseLayer."""
+
+        class HParams(base_layer.BaseLayer.HParams):
+          """Test HParams, inheriting from BaseLayer.HParams."""
+
+          def some_method(self):
+            pass
+
+  def test_hparam_properties_are_disallowed(self):
+
+    expected_msg = 'Unsupported declaration `some_property` on `<class '
+    with self.assertRaisesRegex(ValueError, expected_msg):
+
+      class Layer(base_layer.BaseLayer):  # pylint: disable=unused-variable
+        """Test layer, inheriting from BaseLayer."""
+
+        class HParams(base_layer.BaseLayer.HParams):
+          """Test HParams, inheriting from BaseLayer.HParams."""
+
+          @property
+          def some_property(self):
+            return 42
+
+  def test_hparam_unannotated_attributes_are_disallowed(self):
+
+    expected_msg = 'Unsupported declaration `x` on `<class '
+    with self.assertRaisesRegex(ValueError, expected_msg):
+
+      class Layer(base_layer.BaseLayer):  # pylint: disable=unused-variable
+        """Test layer, inheriting from BaseLayer."""
+
+        class HParams(base_layer.BaseLayer.HParams):
+          """Test HParams, inheriting from BaseLayer.HParams."""
+
+          x = 42
+
 
 class FiddleBaseLayerTest(test_utils.TestCase):
 
@@ -437,11 +490,11 @@ class FiddleBaseLayerTest(test_utils.TestCase):
       expected_to_text = '\n'.join([
           '.activation_split_dims_mapping.out : NoneType',
           f'.cls : {Layer!r}',
-          '.dcn_mesh_shape : (3, 4)',
+          '.dcn_mesh_shape : [3, 4]',
           '.dtype : type/jax.numpy/float32',
           '.fprop_dtype : type/jax.numpy/float16',
-          '.ici_mesh_shape : (1, 2)',
-          ".mesh_axis_names : ('a', 'b')",
+          '.ici_mesh_shape : [1, 2]',
+          ".mesh_axis_names : ['a', 'b']",
           ".name : 'my_layer'",
           ".params_init.method : 'xavier'",
           '.params_init.scale : 1.000001',

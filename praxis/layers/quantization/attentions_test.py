@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
+from jax.experimental import pjit
 import numpy as np
 from praxis import base_layer
 from praxis import py_utils
@@ -37,7 +38,7 @@ class QuantizedAttentionTest(test_utils.TestCase):
 
   @parameterized.named_parameters(
       ('inference', base_layer.QuantizationMode.INFERENCE),
-      ('quantize', base_layer.QuantizationMode.QUANTIZE),
+      ('quantize', base_layer.QuantizationMode.MATERIALIZE),
   )
   def test_attention_projection_quantized(self, mode):
     p = qattentions.AttentionProjection.HParams(
@@ -55,10 +56,13 @@ class QuantizedAttentionTest(test_utils.TestCase):
     self.assertEqual(outputs.shape, (4, 5))
     if mode == base_layer.QuantizationMode.INFERENCE:
       self.assertAllClose(jnp.full((4, 5), 0.0), outputs)
+    else:
+      self.assertRaises(AssertionError, self.assertAllClose,
+                        jnp.full((4, 5), 0.0), outputs)
 
   @parameterized.named_parameters(
       ('inference', base_layer.QuantizationMode.INFERENCE),
-      ('quantize', base_layer.QuantizationMode.QUANTIZE),
+      ('quantize', base_layer.QuantizationMode.MATERIALIZE),
   )
   def test_attention_projection_no_output_proj_quantized(self, mode):
     p = qattentions.AttentionProjection.HParams(
@@ -76,10 +80,13 @@ class QuantizedAttentionTest(test_utils.TestCase):
     self.assertEqual(outputs.shape, (4, 3, 2, 3))
     if mode == base_layer.QuantizationMode.INFERENCE:
       self.assertAllClose(jnp.full((4, 3, 2, 3), 0.0), outputs)
+    else:
+      self.assertRaises(AssertionError, self.assertAllClose,
+                        jnp.full((4, 3, 2, 3), 0.0), outputs)
 
   @parameterized.named_parameters(
       ('inference', base_layer.QuantizationMode.INFERENCE),
-      ('quantize', base_layer.QuantizationMode.QUANTIZE),
+      ('quantize', base_layer.QuantizationMode.MATERIALIZE),
   )
   def test_combined_projection_quantized(self, mode):
     p = qattentions.CombinedQKVProjectionLayer.HParams(
@@ -151,7 +158,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     p_q = qattentions.AttentionProjection.HParams(
         name='_attn_proj_q',
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     for p in [p_f, p_q]:
       p.input_dim = 16
       p.num_heads = 2
@@ -168,7 +175,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     p_q = qattentions.AttentionProjection.HParams(
         name='_attn_proj_q',
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     for p in [p_f, p_q]:
       p.input_dim = 16
       p.num_heads = 2
@@ -185,7 +192,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     p_q = qattentions.AttentionProjection.HParams(
         name='_attn_proj_q',
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     for p in [p_f, p_q]:
       p.input_dim = 256
       p.num_heads = 16
@@ -209,7 +216,7 @@ class QuantizedAttentionSyncTest(test_utils.TestCase):
     p_q = qattentions.CombinedQKVProjectionLayer.HParams(
         name='_attn_qkv_q',
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     for p in [p_f, p_q]:
       p.input_dim = 64
       p.num_heads = 8
@@ -230,8 +237,11 @@ class QuantizeAttentionTest(test_utils.TestCase):
   def test_quantize_attention_projection(self):
     p = qattentions.AttentionProjection.HParams(
         name='_attn_proj_q',
+        mesh_axis_names=['replica', 'mdl', 'data'],
+        weight_split_dims_mapping=base_layer.BaseLayer.WeightShardingHParams(
+            wt=['mdl', 'data']),
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     p.input_dim = 16
     p.num_heads = 2
     p.dim_per_head = 5
@@ -249,14 +259,31 @@ class QuantizeAttentionTest(test_utils.TestCase):
     self.assertEqual(res[base_layer.PARAMS]['w'].shape, (2, 5, 16))
     self.assertEqual(res[base_layer.PARAMS]['w_quantized_scale'].shape, (16,))
 
+    pspec, _ = layer.apply(
+        initial_vars, mutable=[], method=layer.quantized_partitioned_specs)
+    exepected_pspec = {
+        'params': {
+            'w':
+                base_layer.BoxedPartitionSpec(
+                    meta=pjit.PartitionSpec('mdl', 'data')),
+            'w_quantized_scale':
+                base_layer.BoxedPartitionSpec(meta=pjit.PartitionSpec('mdl'))
+        }
+    }
+    self.assertEqual(pspec, exepected_pspec)
+
   def test_quantize_attention_qkv(self):
     p = qattentions.CombinedQKVProjectionLayer.HParams(
         name='_combined_qkv',
         input_dim=5,
         num_heads=6,
         dim_per_head=2,
+        ici_mesh_shape=[0, 1, 2],
+        mesh_axis_names=['replica', 'mdl', 'data'],
+        weight_split_dims_mapping=base_layer.BaseLayer.WeightShardingHParams(
+            wt=['replica', 'mdl', 'data']),
         quantization=base_layer.QuantizationHParams(
-            mode=base_layer.QuantizationMode.QUANTIZE))
+            mode=base_layer.QuantizationMode.MATERIALIZE))
     layer = instantiate(p)
     inputs = jnp.ones((4, 5), dtype=jnp.bfloat16)
     prng_key = jax.random.PRNGKey(seed=123)
@@ -268,6 +295,20 @@ class QuantizeAttentionTest(test_utils.TestCase):
     self.assertEqual(res[base_layer.PARAMS]['w'].shape, (3, 5, 6, 2))
     self.assertEqual(res[base_layer.PARAMS]['w_quantized_scale'].shape,
                      (3, 6, 2))
+
+    pspec, _ = layer.apply(
+        initial_vars, mutable=[], method=layer.quantized_partitioned_specs)
+    exepected_pspec = {
+        'params': {
+            'w':
+                base_layer.BoxedPartitionSpec(
+                    meta=pjit.PartitionSpec(None, 'replica', 'mdl', 'data')),
+            'w_quantized_scale':
+                base_layer.BoxedPartitionSpec(
+                    meta=pjit.PartitionSpec(None, 'mdl', 'data'))
+        }
+    }
+    self.assertEqual(pspec, exepected_pspec)
 
 if __name__ == '__main__':
   absltest.main()

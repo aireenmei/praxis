@@ -79,6 +79,22 @@ class Conv2D(base_layer.BaseLayer):
     tf_equivalent_padding: bool = False
     is_causal: bool = False
 
+  @classmethod
+  def HParamsDepthwise(cls,
+                       *,
+                       kernel_shape: Sequence[int],
+                       in_channels: int,
+                       channel_multipliers: int = 1,
+                       **hparams):
+    """DepthwiseConv2D configuration for Conv2D and its subclasses."""
+    if len(kernel_shape) != 2:
+      raise ValueError(
+          f'kernel_shape must have two elements, got {len(kernel_shape)}')
+    if 'filter_shape' in hparams:
+      raise ValueError('filter_shape cannot be specified in HParamsDepthwise')
+    filter_shape = tuple(kernel_shape) + (1, in_channels * channel_multipliers)
+    return cls.HParams(filter_shape=filter_shape, **hparams)
+
   def setup(self) -> None:
     p = self.hparams
     assert p.name
@@ -218,7 +234,7 @@ class ConvBNAct(Conv2D):
     """
     batch_norm_tpl: Optional[BaseHParams] = sub_config_field(
         normalizations.BatchNorm.HParams)
-    activation_tpl: activations.BaseActivation = sub_config_field(
+    activation_tpl: activations.BaseActivation.HParams = sub_config_field(
         activations.ReLU.HParams)
 
   def setup(self) -> None:
@@ -289,7 +305,7 @@ class ConvBNActWithPadding(ConvBNAct):
     p = self.hparams
 
     # Applying padding.
-    inputs *= (1 - paddings)[:, :, None, None]
+    inputs = py_utils.apply_padding(inputs, paddings[:, :, None, None])
 
     outputs = super().__call__(inputs)
 
@@ -329,7 +345,6 @@ class ConvBNActWithPadding(ConvBNAct):
     return outputs, out_padding
 
 
-# TODO(nanxinchen): add Depthwise Conv2D support
 class BaseDepthwiseConv1D(base_layer.BaseLayer):
   """Base class for Depthwise 1D convolution."""
 
@@ -438,7 +453,7 @@ class DepthwiseConv1D(BaseDepthwiseConv1D):
 
     # Applying padding.
     if paddings is not None:
-      inputs = inputs * (1.0 - jnp.expand_dims(paddings, axis=-1))
+      inputs = py_utils.apply_padding(inputs, paddings[:, :, None])
 
     dn = jax.lax.conv_dimension_numbers(inputs.shape,
                                         self.get_w().shape,
@@ -631,7 +646,7 @@ class LightConv1D(base_layer.BaseLayer):
 
     unnormalized_inputs = inputs
 
-    inputs = self.ln(inputs)
+    inputs = self.ln(inputs, paddings)
     act_inputs = self.linear_start_act(inputs)
     gated_inputs = self.linear_start_gated(inputs)
     inputs = act_inputs * jax.nn.sigmoid(gated_inputs)

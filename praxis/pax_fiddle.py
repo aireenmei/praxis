@@ -20,7 +20,8 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
-from typing import overload, TypeVar, Callable, Any, Union, Optional, Collection, Generic
+import functools
+from typing import overload, Any, Callable, Collection, Generic, Optional, TypeVar, Union
 
 import fiddle as fdl
 from fiddle import building
@@ -102,12 +103,12 @@ class PaxConfig(Generic[T], fdl.Config[T], CloneAndSetMixin):
     source_fields = {
         field.name: field
         for field in dataclasses.fields(source.__fn_or_cls__)
-        if field.init and field.name not in ('parent', 'name')
+        if field.init and field.name != 'parent'
     }
     self_fields = {
         field.name: field
         for field in dataclasses.fields(self.__fn_or_cls__)
-        if field.init and field.name not in ('parent', 'name')
+        if field.init and field.name != 'parent'
     }
 
     for name in source_fields:
@@ -180,14 +181,7 @@ def auto_config(fn=None, **auto_config_kwargs) -> Any:
   auto_config_kwargs['experimental_exemption_policy'] = (
       _auto_config_exemption_policy)
   auto_config_kwargs['experimental_allow_control_flow'] = True
-
-  def replace_configs(value, state):
-    """Replaces fdl.Config with PaxConfig."""
-    if isinstance(value, fdl.Config):
-      result = state.flattened_map_children(value)
-      return PaxConfig.__unflatten__(result.values, result.metadata)
-    else:
-      return state.map_children(value)
+  auto_config_kwargs['experimental_config_cls'] = PaxConfig
 
   def make_auto_config(fn):
 
@@ -209,20 +203,7 @@ def auto_config(fn=None, **auto_config_kwargs) -> Any:
       return fn
 
     # Wrap `fn` using Fiddle auto_config.
-    auto_config_obj = fdl_auto_config.auto_config(fn, **auto_config_kwargs)
-
-    # Replace the original `as_buildable` method (which returns `fdl.Config`
-    # objects with one that returns `PaxConfig` objects.
-    old_as_buildable = auto_config_obj.as_buildable
-
-    def new_as_buildable(*args, **kwargs):
-      cfg = old_as_buildable(*args, **kwargs)
-      suspend_tracking = getattr(history, 'suspend_tracking',
-                                 contextlib.nullcontext)
-      with suspend_tracking():
-        return daglish.MemoizedTraversal.run(replace_configs, cfg)
-
-    return dataclasses.replace(auto_config_obj, buildable_func=new_as_buildable)
+    return fdl_auto_config.auto_config(fn, **auto_config_kwargs)
 
   return make_auto_config if fn is None else make_auto_config(fn)
 
@@ -361,3 +342,45 @@ def empty_flax_module_stack():
     yield
   finally:
     module_stack[:] = old_modules  # Restore module stack.
+
+
+_hparams_node_traverser_registry = daglish.NodeTraverserRegistry(
+    use_fallback=True)
+
+
+def _register_traversers_for_subclass(subclass):
+  """Registers traversal routines for an HParams subclass."""
+  fields = dataclasses.fields(subclass)
+  names = tuple(field.name for field in fields)
+  path_elements = tuple(daglish.Attr(field.name) for field in fields)
+
+  def _flatten(value):
+    return tuple(getattr(value, name) for name in names), ()
+
+  def _unflatten(values, unused_metadata):
+    return subclass(**dict(zip(names, values)))
+
+  def _path_elements(unused_value):
+    return list(path_elements)
+
+  _hparams_node_traverser_registry.register_node_traverser(
+      subclass,
+      flatten_fn=_flatten,
+      unflatten_fn=_unflatten,
+      path_elements_fn=_path_elements,
+  )
+
+
+# APIs from fiddle.daglish, that are HParams-aware.
+@dataclasses.dataclass
+class BasicTraversal(daglish.BasicTraversal):
+  registry: daglish.NodeTraverserRegistry = _hparams_node_traverser_registry
+
+
+@dataclasses.dataclass
+class MemoizedTraversal(daglish.MemoizedTraversal):
+  registry: daglish.NodeTraverserRegistry = _hparams_node_traverser_registry
+
+
+iterate = functools.partial(
+    daglish.iterate, registry=_hparams_node_traverser_registry)

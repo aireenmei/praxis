@@ -118,6 +118,11 @@ class BaseInput(base_hyperparams.BaseParameterizable):
     assert hparams.batch_size is not None
     return hparams.batch_size
 
+  @classmethod
+  def get_global_batch_size(cls, hparams: BaseInput.HParams) -> int:
+    assert hparams.num_infeed_hosts is not None
+    return cls.get_batch_size(hparams) * hparams.num_infeed_hosts
+
   def __init__(self, hparams: BaseInput.HParams) -> None:
     if self._VALIDATE_BATCH_SIZE_NOT_NONE and (hparams.batch_size is None):
       raise ValueError('Must specify p.batch_size.')
@@ -135,6 +140,9 @@ class BaseInput(base_hyperparams.BaseParameterizable):
           'Remote input is not supported when there are multiple controllers.')
 
   def get_next(self) -> NestedJTensor:
+    raise NotImplementedError
+
+  def get_child(self, input_name: str) -> NestedJTensor:
     raise NotImplementedError
 
   def get_next_padded(self) -> NestedJTensor:
@@ -761,6 +769,9 @@ class MultiInput(BaseInput):
     for input_name, input_gen in self._inputs.items():
       input_batches[input_name] = input_gen.get_next()
     return NestedMap(input_batches)
+
+  def get_child(self, input_name: str) -> NestedJTensor:
+    return self._inputs[input_name]
 
   def reset(self) -> None:
     for _, input_gen in self._inputs.items():

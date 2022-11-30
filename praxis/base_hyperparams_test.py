@@ -20,14 +20,20 @@ import functools
 import inspect
 import pickle
 import textwrap
-from typing import Optional, List, Tuple, Any
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 from absl.testing import absltest
 import fiddle as fdl
+from flax.core import frozen_dict
+from jax import numpy as jnp
 # Internal config_dict import from ml_collections
+import numpy as np
 from praxis import base_hyperparams
 from praxis import base_layer
 from praxis import pax_fiddle
+import tensorflow.compat.v2 as tf
+
+nested_struct_to_text = base_hyperparams.nested_struct_to_text
 
 
 class SimpleTestClass(base_hyperparams.BaseParameterizable):
@@ -90,6 +96,20 @@ class FiddleTestClass(base_hyperparams.BaseParameterizable):
 
 def sample_fn(x, y=5):
   return (x, y)
+
+
+class FiddleToTextTestClass(base_layer.FiddleBaseLayer):
+
+  a: int = 4
+  b: str = 'b'
+  tpl: Any = None
+
+
+class NestedStructToTextTestClass(base_hyperparams.BaseParameterizable):
+
+  class HParams(base_hyperparams.BaseHyperParams):
+    tpl: Any = base_hyperparams.sub_config_field(None)
+    a: Optional[frozen_dict.FrozenDict] = None
 
 
 class HyperParamsTest(absltest.TestCase):
@@ -160,14 +180,20 @@ class HyperParamsTest(absltest.TestCase):
 
   def test_fdl_config_to_text(self):
     x = FiddleTestClass.HParams(
-        f=pax_fiddle.Config(sample_fn, x=10),
+        f=pax_fiddle.Config(sample_fn, x=[pax_fiddle.Config(sample_fn, 2),
+                                          pax_fiddle.Config(sample_fn, 3, 4)]),
         g=pax_fiddle.Config(SimpleTestClass, SimpleTestClass.HParams(a=12)))
     self.assertEqual(
         x.to_text(),
         textwrap.dedent("""\
         cls : type/__main__/FiddleTestClass
         f.cls : callable/__main__/sample_fn
-        f.x : 10
+        f.x[0].cls : callable/__main__/sample_fn
+        f.x[0].x : 2
+        f.x[0].y : 5
+        f.x[1].cls : callable/__main__/sample_fn
+        f.x[1].x : 3
+        f.x[1].y : 4
         f.y : 5
         g.cls : type/__main__/SimpleTestClass
         g.hparams.a : 12
@@ -175,6 +201,14 @@ class HyperParamsTest(absltest.TestCase):
         g.hparams.cls : type/__main__/SimpleTestClass
         h : 3.0
         """))
+
+  def test_frozen_dict_to_text(self):
+    x = frozen_dict.FrozenDict(foo=12, bar=55)
+    self.assertEqual(base_hyperparams.nested_struct_to_text(x),
+                     textwrap.dedent("""\
+                     bar : 55
+                     foo : 12
+                     """))
 
   # Internal test test_config_dict_to_text
   def test_freeze_params(self):
@@ -418,6 +452,198 @@ class HyperParamsTest(absltest.TestCase):
         field for field in dataclasses.fields(Foo.HParams)
         if field.name == 'a_tpl')
     self.assertTrue(field.metadata.get('custom'))
+
+
+class NestedStructToTextTestCase(absltest.TestCase):
+
+  def test_dict(self):
+    self.assertEqual(
+        nested_struct_to_text({
+            'hi': 7,
+            'bye': 3
+        }).splitlines(), [
+            'bye : 3',
+            'hi : 7',
+        ])
+
+  def test_hparams_frozen_dict(self):
+    input_dict = frozen_dict.FrozenDict({'hi': 7, 'bye': 3})
+    x = NestedStructToTextTestClass.HParams(a=input_dict)
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            'a.bye : 3',
+            'a.hi : 7',
+            f'cls : type/{__name__}/NestedStructToTextTestClass',
+            'tpl : NoneType',
+        ])
+
+  def test_frozen_dict(self):
+    x = frozen_dict.FrozenDict(foo=12, bar=55)
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            'bar : 55',
+            'foo : 12',
+        ])
+
+  def test_named_tuple(self):
+
+    class MyNamedTuple(NamedTuple):
+      b: int
+      a: str
+
+    self.assertEqual(
+        nested_struct_to_text(MyNamedTuple(7, 'hi')).splitlines(), [
+            " : {'a': 'hi', 'b': 7}",
+        ])
+
+  def test_np_array(self):
+    self.assertEqual(
+        nested_struct_to_text(np.array([1, 2.1, 3.01, 4.001])).splitlines(), [
+            ' : [1.   , 2.1  , 3.01 , 4.001]',
+        ])
+
+  def test_tf_dtype(self):
+    self.assertEqual(
+        nested_struct_to_text(tf.float32).splitlines(), [
+            ' : float32',
+        ])
+
+  def test_sub_config(self):
+    sub_config = SimpleTestClass.HParams(7)
+    x = NestedStructToTextTestClass.HParams(tpl=sub_config)
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            'a : NoneType',
+            f'cls : type/{__name__}/NestedStructToTextTestClass',
+            'tpl.a : 7',
+            "tpl.b : 'b'",
+            f'tpl.cls : type/{__name__}/SimpleTestClass',
+        ])
+
+  def test_sub_fiddle_config(self):
+    sub_config = pax_fiddle.Config(FiddleToTextTestClass, 7)
+    x = NestedStructToTextTestClass.HParams(tpl=sub_config)
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            'a : NoneType',
+            f'cls : type/{__name__}/NestedStructToTextTestClass',
+            'tpl.a : 4',
+            'tpl.activation_split_dims_mapping.out : NoneType',
+            "tpl.b : 'b'",
+            f"tpl.cls : <class '{__name__}.FiddleToTextTestClass'>",
+            'tpl.dcn_mesh_shape : NoneType',
+            'tpl.dtype : 7',
+            'tpl.fprop_dtype : NoneType',
+            'tpl.ici_mesh_shape : NoneType',
+            'tpl.mesh_axis_names : NoneType',
+            'tpl.name : NoneType',
+            "tpl.params_init.cls : <class 'praxis.base_layer.WeightInit'>",
+            "tpl.params_init.method : 'xavier'",
+            'tpl.params_init.scale : 1.000001',
+            'tpl.shared_weight_layer_id : NoneType',
+            'tpl.skip_lp_regularization : NoneType',
+            'tpl.tpl : NoneType',
+            'tpl.weight_split_dims_mapping.wt : NoneType',
+        ])
+
+  def test_sub_hparams_config(self):
+    sub_config = SimpleTestClass.HParams(7)
+    x = pax_fiddle.Config(FiddleToTextTestClass, 7, tpl=sub_config)
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            '.a : 4',
+            '.activation_split_dims_mapping.out : NoneType',
+            ".b : 'b'",
+            f".cls : <class '{__name__}.FiddleToTextTestClass'>",
+            '.dcn_mesh_shape : NoneType',
+            '.dtype : 7',
+            '.fprop_dtype : NoneType',
+            '.ici_mesh_shape : NoneType',
+            '.mesh_axis_names : NoneType',
+            '.name : NoneType',
+            ".params_init.cls : <class 'praxis.base_layer.WeightInit'>",
+            ".params_init.method : 'xavier'",
+            '.params_init.scale : 1.000001',
+            '.shared_weight_layer_id : NoneType',
+            '.skip_lp_regularization : NoneType',
+            '.tpl.a : 7',
+            ".tpl.b : 'b'",
+            f'.tpl.cls : type/{__name__}/SimpleTestClass',
+            '.weight_split_dims_mapping.wt : NoneType',
+        ])
+
+  def test_config_in_dict(self):
+    sub_config = SimpleTestClass.HParams(7)
+    x = {'foo': sub_config, 'bar': 3}
+    self.assertEqual(
+        nested_struct_to_text(x).splitlines(), [
+            'bar : 3',
+            'foo.a : 7',
+            "foo.b : 'b'",
+            f'foo.cls : type/{__name__}/SimpleTestClass',
+        ])
+
+  def test_config_in_list(self):
+    config = SimpleTestClass.HParams(7)
+    self.assertEqual(
+        nested_struct_to_text([config]).splitlines(), [
+            '[0].a : 7',
+            "[0].b : 'b'",
+            f'[0].cls : type/{__name__}/SimpleTestClass',
+        ])
+
+  def test_mixed_list(self):
+    config = SimpleTestClass.HParams(7)
+    self.assertEqual(
+        nested_struct_to_text([config, 1]).splitlines(), [
+            " : [{'a': 7, 'b': 'b', 'cls': 'type/" + __name__ +
+            "/SimpleTestClass'}, 1]",
+        ])
+
+  def test_mixed_fiddle_list(self):
+    config = pax_fiddle.Config(FiddleToTextTestClass, 7)
+    # pylint: disable=implicit-str-concat
+    self.assertEqual(
+        nested_struct_to_text([config, 1]).splitlines(), [
+            " : [\"<PaxConfig[FiddleToTextTestClass(\\n  dtype=7,\\n  params_init="
+            "<PaxConfig[WeightInit(method='xavier', scale=1.000001)]>,\\n  "
+            'weight_split_dims_mapping[#praxis.pax_fiddle.DoNotBuild]=<'
+            'PaxConfig[FiddleBaseLayer.WeightShardingHParams()]>,\\n  '
+            'activation_split_dims_mapping[#praxis.pax_fiddle.DoNotBuild]=<'
+            "PaxConfig[FiddleBaseLayer.ActivationShardingHParams()]>)]>\", 1]",
+        ])
+    # pylint: enable=implicit-str-concat
+
+  def test_callable(self):
+
+    def foo():
+      return 7
+
+    # pylint: disable=implicit-str-concat
+    self.assertEqual(
+        nested_struct_to_text(foo).splitlines(), [
+            f' : callable/{__name__}/'
+            'NestedStructToTextTestCase.test_callable.<locals>.foo',
+        ])
+    # pylint: enable=implicit-str-concat
+
+  def test_list(self):
+    self.assertEqual(
+        nested_struct_to_text([1, 2, 3.1]).splitlines(), [
+            ' : [1, 2, 3.1]',
+        ])
+
+  def test_tuple(self):
+    self.assertEqual(
+        nested_struct_to_text((1, 2, 3.1)).splitlines(), [
+            ' : (1, 2, 3.1)',
+        ])
+
+  def test_jax_dtype(self):
+    self.assertEqual(
+        nested_struct_to_text(jnp.float32).splitlines(), [
+            ' : type/jax.numpy/float32',
+        ])
 
 
 if __name__ == '__main__':
