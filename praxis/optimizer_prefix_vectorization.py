@@ -64,7 +64,7 @@ GeneralGradientTransformation = optimizers.GeneralGradientTransformation
 ShardedGradientTransformation = optimizers.ShardedGradientTransformation
 
 NO_PREFIX_KEY = 'no_prefix'
-_REPEAT_PREFIX_SEP = '#'
+_REPEAT_PREFIX_SEP = '_'
 
 
 def has_no_prefix(dct: NestedMap) -> bool:
