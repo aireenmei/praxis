@@ -506,9 +506,9 @@ class LearnersTest(test_utils.TestCase):
     # Optimizers are chained as l1 - l2 - optimizer update - weight_decay.
     # Due to a new optax update, chained pytrees are masked.
     opt_idx = 2
-    pspec_1 = partition_spec['p#2#i-1'].inner_state
+    pspec_1 = partition_spec['p_2_i-1'].inner_state
     pspec_2 = partition_spec[opt_vec.NO_PREFIX_KEY].inner_state
-    pspec_3 = partition_spec['p#2.2#tsdata,smdl.'].inner_state
+    pspec_3 = partition_spec['p_2.2_tsdata,smdl.'].inner_state
     self.assertEqual(pspec_1[opt_idx].a.shape, ())
     self.assertEqual(pspec_1[opt_idx].a.repeat_prefix, [2])
     self.assertEqual(
